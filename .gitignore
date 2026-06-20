@@ -1,0 +1,57 @@
+# Build output (out-of-source CMake builds)
+/build/
+build*/
+cmake-build-*/
+
+# CMake artifacts (if anyone configures in-tree)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+*.cmake.lock
+
+# Compiled binaries / objects / libs
+audio-gui
+pa-alsa-bridge
+pulse-jack-bridge
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+
+# Qt: generated moc/uic/rcc + autogen
+moc_*.cpp
+moc_*.h
+ui_*.h
+qrc_*.cpp
+*_autogen/
+*.moc
+.qmake.stash
+*.pro.user*
+
+# Debug / analysis
+*.dSYM/
+core
+vgcore.*
+perf.data*
+*.gcda
+*.gcno
+*.gcov
+
+# Editor / IDE
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+*.swp
+*.swo
+*~
+.clangd/
+
+# OS cruft
+.DS_Store
+Thumbs.db
