@@ -13,11 +13,11 @@ bridges, so apps that only speak PulseAudio still get sound.
   (e.g. `amixer`, media keys) are reflected live.
 - **Output level meter** — a live stereo peak meter fed by whichever bridge is
   running (the bridge publishes its mixed peak in a shared-memory page).
-- **PulseAudio compatibility** — a 3-way routing choice (the two bridges are
+- **Audio options** — a 3-way routing choice (the two bridges are
   mutually exclusive, they bind the same PA socket):
-  - **PulseAudio → ALSA** *(default)* — runs `pa-alsa-bridge`.
+  - **PA Bridge → ALSA** *(default)* — runs `pa-alsa-bridge`.
   - **Pure ALSA (no bridge)** — nothing runs; only native-ALSA apps get sound.
-  - **PulseAudio → JACK** — runs `pulse-jack-bridge`, exposing `pulse_bridge`
+  - **PA Bridge → JACK** — runs `pulse-jack-bridge`, exposing `pulse_bridge`
     playback ports in a JACK patchbay. Enabled only while `jackd` is running
     (detected live).
 - **Switches** — Capture and IEC958 (S/PDIF) toggles, when the card provides them.

@@ -129,13 +129,13 @@ QWidget* MainWindow::buildMixerSection()
 
 QWidget* MainWindow::buildRoutingSection()
 {
-  auto* group = new QGroupBox(tr("PulseAudio compatibility && switches"), this);
+  auto* group = new QGroupBox(tr("Audio options && switches"), this);
   auto* col = new QVBoxLayout(group);
 
   // ---- 3-way routing radio (mutually exclusive bridges) ----
-  auto* alsaRadio = new QRadioButton(tr("PulseAudio → ALSA (default)"), group);
+  auto* alsaRadio = new QRadioButton(tr("PA Bridge → ALSA (default)"), group);
   auto* pureRadio = new QRadioButton(tr("Pure ALSA (no bridge)"), group);
-  m_jackRadio = new QRadioButton(tr("PulseAudio → JACK"), group);
+  m_jackRadio = new QRadioButton(tr("PA Bridge → JACK"), group);
 
   // Reflect what is actually active (a bridge may already be running from login)
   // without re-triggering setMode while we set up.
