@@ -34,6 +34,10 @@ constexpr int kJackProbeIntervalMs = 2000;
 constexpr const char* kSettingsKey = "routing/mode";
 constexpr const char* kDeviceKey = "routing/device";
 
+// Swallow libjack's chatty stderr ("Cannot connect to server...", "JackShm...")
+// that it prints on every failed probe when no jackd is running.
+void jackSilent(const char*) {}
+
 bool isValidMode(int v)
 {
   return v == static_cast<int>(BridgeManager::Mode::PulseToAlsa) || v == static_cast<int>(BridgeManager::Mode::PureAlsa)
@@ -49,6 +53,17 @@ BridgeManager::BridgeManager(bool enableJackProbe, QObject* parent)
   m_jackLib = dlopen("libjack.so.0", RTLD_LAZY | RTLD_LOCAL);
   if (!m_jackLib)
     m_jackLib = dlopen("libjack.so", RTLD_LAZY | RTLD_LOCAL);
+
+  // Redirect libjack's error/info messages to a no-op so a missing jackd does not
+  // spam our terminal every probe interval.
+  if (m_jackLib)
+  {
+    using SetMsgFn = void (*)(void (*)(const char*));
+    if (auto setErr = reinterpret_cast<SetMsgFn>(dlsym(m_jackLib, "jack_set_error_function")))
+      setErr(&jackSilent);
+    if (auto setInfo = reinterpret_cast<SetMsgFn>(dlsym(m_jackLib, "jack_set_info_function")))
+      setInfo(&jackSilent);
+  }
 
   if (enableJackProbe)
   {
