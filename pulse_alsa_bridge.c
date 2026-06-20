@@ -322,7 +322,18 @@ static volatile int g_running = 1;
 static char         g_socket_path[512];
 static int          g_debug;   /* set once at startup from PULSE_BRIDGE_DEBUG env var */
 
+/* Live output-device switch: the GUI writes the new ALSA device string to
+ * g_ctl_path and sends SIGUSR1. The playback thread reopens ALSA in place, so
+ * the PA socket and all client streams stay connected (no app restart). */
+static char                  g_ctl_path[512];  /* from PULSE_BRIDGE_CTL_FILE env */
+static volatile sig_atomic_t g_reopen = 0;
+
 static void sighandler(int s) { (void)s; g_running = 0; }
+static void reopenhandler(int s) { (void)s; g_reopen = 1; }
+
+/* Defined in the ALSA section below; used by the playback thread above it. */
+static void alsa_reopen(const char *dev);
+static int  read_ctl_device(char *out, size_t outsz);
 
 /* ======================================================================
  * Tagstruct write helpers
@@ -1226,6 +1237,18 @@ static void *play_loop(void *arg) {
     if (N > PLAY_MAX_FRAMES) N = PLAY_MAX_FRAMES;
 
     while (g_running) {
+        /* Live output-device switch requested via SIGUSR1: reopen ALSA in place,
+         * keeping the PA socket and all client streams connected. */
+        if (g_reopen) {
+            g_reopen = 0;
+            char dev[512];
+            if (read_ctl_device(dev, sizeof(dev)) == 0) {
+                alsa_reopen(dev);
+                N = g_period;
+                if (N > PLAY_MAX_FRAMES) N = PLAY_MAX_FRAMES;
+            }
+        }
+
         memset(outL, 0, N * sizeof(float));
         memset(outR, 0, N * sizeof(float));
 
@@ -1279,9 +1302,15 @@ static void *play_loop(void *arg) {
  * ALSA device setup
  * ====================================================================== */
 
-static int alsa_open(const char *dev) {
+/* Open and configure a playback handle into *out without touching the globals,
+ * so a live switch can validate the new device before swapping. want_rate is the
+ * requested rate (Hz); the negotiated rate/period/buffer are returned. */
+static int alsa_open_handle(snd_pcm_t **out, const char *dev, unsigned want_rate,
+                           unsigned *neg_rate, snd_pcm_uframes_t *neg_period,
+                           snd_pcm_uframes_t *neg_bufsz) {
+    snd_pcm_t *pcm = NULL;
     int err;
-    if ((err = snd_pcm_open(&g_pcm, dev, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+    if ((err = snd_pcm_open(&pcm, dev, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
         fprintf(stderr,
             "pulse-alsa-bridge: cannot open ALSA device '%s': %s\n"
             "  Check that a sound card is present and your ALSA config (~/.asoundrc) is valid.\n",
@@ -1291,34 +1320,64 @@ static int alsa_open(const char *dev) {
 
     snd_pcm_hw_params_t *hw;
     snd_pcm_hw_params_alloca(&hw);
-    snd_pcm_hw_params_any(g_pcm, hw);
+    snd_pcm_hw_params_any(pcm, hw);
 
-    if ((err = snd_pcm_hw_params_set_access(g_pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
-        (err = snd_pcm_hw_params_set_format(g_pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0 ||
-        (err = snd_pcm_hw_params_set_channels(g_pcm, hw, 2)) < 0) {
+    if ((err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
+        (err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0 ||
+        (err = snd_pcm_hw_params_set_channels(pcm, hw, 2)) < 0) {
         fprintf(stderr, "pulse-alsa-bridge: hw params (access/format/channels): %s\n",
                 snd_strerror(err));
-        return -1;
+        goto fail;
     }
 
-    unsigned int rate = 44100;   /* requested; set_rate_near adapts to whatever the device offers */
-    if ((err = snd_pcm_hw_params_set_rate_near(g_pcm, hw, &rate, 0)) < 0) {
+    unsigned int rate = want_rate;
+    if ((err = snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, 0)) < 0) {
         fprintf(stderr, "pulse-alsa-bridge: set rate: %s\n", snd_strerror(err));
-        return -1;
+        goto fail;
     }
 
     snd_pcm_uframes_t period = 1024;   /* default period/buffer; adapts to the device */
     snd_pcm_uframes_t bufsz  = 4096;
-    snd_pcm_hw_params_set_period_size_near(g_pcm, hw, &period, 0);
-    snd_pcm_hw_params_set_buffer_size_near(g_pcm, hw, &bufsz);
+    snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, 0);
+    snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &bufsz);
 
-    if ((err = snd_pcm_hw_params(g_pcm, hw)) < 0) {
+    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
         fprintf(stderr, "pulse-alsa-bridge: hw params commit: %s\n", snd_strerror(err));
-        return -1;
+        goto fail;
     }
 
     snd_pcm_hw_params_get_period_size(hw, &period, NULL);
     snd_pcm_hw_params_get_buffer_size(hw, &bufsz);
+
+    /* sw params: start once a buffer is queued, wake per period */
+    snd_pcm_sw_params_t *sw;
+    snd_pcm_sw_params_alloca(&sw);
+    snd_pcm_sw_params_current(pcm, sw);
+    snd_pcm_sw_params_set_start_threshold(pcm, sw, bufsz);
+    snd_pcm_sw_params_set_avail_min(pcm, sw, period);
+    snd_pcm_sw_params(pcm, sw);
+
+    snd_pcm_prepare(pcm);
+
+    *out        = pcm;
+    *neg_rate   = rate;
+    *neg_period = period;
+    *neg_bufsz  = bufsz;
+    return 0;
+
+fail:
+    snd_pcm_close(pcm);
+    return -1;
+}
+
+static int alsa_open(const char *dev) {
+    snd_pcm_t        *pcm = NULL;
+    unsigned          rate = 0;
+    snd_pcm_uframes_t period = 0, bufsz = 0;
+    /* Request 44100; set_rate_near adapts to whatever the device offers. */
+    if (alsa_open_handle(&pcm, dev, 44100, &rate, &period, &bufsz) < 0)
+        return -1;
+    g_pcm    = pcm;
     g_rate   = rate;
     g_period = period;
     g_bufsz  = bufsz;
@@ -1326,16 +1385,52 @@ static int alsa_open(const char *dev) {
         fprintf(stderr, "pulse-alsa-bridge: period %lu > %d frames, capping write chunk\n",
                 (unsigned long)g_period, PLAY_MAX_FRAMES);
     }
+    return 0;
+}
 
-    /* sw params: start once a buffer is queued, wake per period */
-    snd_pcm_sw_params_t *sw;
-    snd_pcm_sw_params_alloca(&sw);
-    snd_pcm_sw_params_current(g_pcm, sw);
-    snd_pcm_sw_params_set_start_threshold(g_pcm, sw, g_bufsz);
-    snd_pcm_sw_params_set_avail_min(g_pcm, sw, g_period);
-    snd_pcm_sw_params(g_pcm, sw);
+/* Live device switch (playback thread only). Reopens at the established g_rate so
+ * client streams — negotiated at g_rate — stay valid; plughw/plug converts to the
+ * device's native rate. On failure the current device is kept (audio continues). */
+static void alsa_reopen(const char *dev) {
+    snd_pcm_t        *pcm = NULL;
+    unsigned          rate = 0;
+    snd_pcm_uframes_t period = 0, bufsz = 0;
+    if (alsa_open_handle(&pcm, dev, g_rate, &rate, &period, &bufsz) < 0) {
+        fprintf(stderr, "pulse-alsa-bridge: live switch to '%s' failed; keeping current device\n", dev);
+        return;
+    }
+    if (rate != g_rate)
+        fprintf(stderr, "pulse-alsa-bridge: warning: '%s' gave %u Hz (wanted %u); pitch may be off\n",
+                dev, rate, g_rate);
 
-    snd_pcm_prepare(g_pcm);
+    snd_pcm_t *old = g_pcm;
+    g_pcm    = pcm;        /* the playback thread is the only g_pcm user: safe swap */
+    g_period = period;
+    g_bufsz  = bufsz;
+    snd_pcm_drop(old);
+    snd_pcm_close(old);
+    fprintf(stderr, "pulse-alsa-bridge: switched output to '%s' (%u Hz)\n", dev, g_rate);
+}
+
+/* Read the device string the GUI left in the control file (one line). Empty or
+ * missing -> "default". Returns 0 on success, -1 if no control file is set. */
+static int read_ctl_device(char *out, size_t outsz) {
+    if (!g_ctl_path[0])
+        return -1;
+    FILE *f = fopen(g_ctl_path, "r");
+    if (!f)
+        return -1;
+    if (!fgets(out, (int)outsz, f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    char *nl = strchr(out, '\n');
+    if (nl) *nl = '\0';
+    if (!out[0]) {
+        strncpy(out, "default", outsz - 1);
+        out[outsz - 1] = '\0';
+    }
     return 0;
 }
 
@@ -1416,9 +1511,25 @@ int main(int argc, char *argv[]) {
 
     g_debug = !!getenv("PULSE_BRIDGE_DEBUG");
 
+    /* Control file for live device switches (optional; GUI sets it). */
+    const char *ctl = getenv("PULSE_BRIDGE_CTL_FILE");
+    if (ctl && *ctl) {
+        strncpy(g_ctl_path, ctl, sizeof(g_ctl_path) - 1);
+        g_ctl_path[sizeof(g_ctl_path) - 1] = '\0';
+    }
+
     signal(SIGTERM, sighandler);
     signal(SIGINT,  sighandler);
     signal(SIGPIPE, SIG_IGN);
+
+    /* SIGUSR1 = live output-device switch. Use sigaction so the handler stays
+     * installed across repeated switches (signal() may reset to SIG_DFL under
+     * _POSIX_C_SOURCE, which would kill the bridge on the second switch). */
+    struct sigaction sa_usr1;
+    memset(&sa_usr1, 0, sizeof(sa_usr1));
+    sa_usr1.sa_handler = reopenhandler;
+    sa_usr1.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &sa_usr1, NULL);
 
     /* Open ALSA (optional device override via env) */
     const char *dev = getenv("PULSE_BRIDGE_ALSA_DEV");

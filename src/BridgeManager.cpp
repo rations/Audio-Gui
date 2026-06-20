@@ -75,6 +75,15 @@ QString BridgeManager::bridgePath(const QString& name) const
   return QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(name);
 }
 
+QString BridgeManager::ctlFilePath() const
+{
+  // Same per-user runtime dir as the pidfile; the bridge reads this on SIGUSR1.
+  QString dir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+  if (dir.isEmpty())
+    dir = QDir::tempPath();
+  return QDir(dir).absoluteFilePath(QStringLiteral("audio-gui-bridge.dev"));
+}
+
 QString BridgeManager::runStatePath() const
 {
   // Per-user runtime dir (XDG_RUNTIME_DIR); cleared on reboot, which is fine —
@@ -202,6 +211,8 @@ qint64 BridgeManager::startBridgeDetached(const QString& binary, const QString& 
   QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
   if (!alsaDevice.isEmpty())
     env.insert(QStringLiteral("PULSE_BRIDGE_ALSA_DEV"), alsaDevice);
+  // Let the bridge accept live device switches (SIGUSR1 + this file).
+  env.insert(QStringLiteral("PULSE_BRIDGE_CTL_FILE"), ctlFilePath());
   p.setProcessEnvironment(env);
 
   qint64 pid = -1;
@@ -324,14 +335,43 @@ void BridgeManager::setMode(Mode mode)
   applyMode(mode, /*force=*/false);
 }
 
+bool BridgeManager::liveSwitchDevice(qint64 pid) const
+{
+  // The bridge opens "default" when the control file holds an empty/"default"
+  // string, so resolve "" to "default" here.
+  QString dev = resolveAlsaDevice();
+  if (dev.isEmpty())
+    dev = QStringLiteral("default");
+
+  QSaveFile f(ctlFilePath());
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    return false;
+  f.write(dev.toUtf8());
+  f.write("\n");
+  if (!f.commit())
+    return false;
+
+  return ::kill(static_cast<pid_t>(pid), SIGUSR1) == 0;
+}
+
 void BridgeManager::setDevice(const QString& token)
 {
   if (token == currentDevice())
     return;
   persistDevice(token);
-  // Restart the currently active mode so the new device takes effect live. Only
-  // the PulseToAlsa bridge consumes the device, but forcing a restart in other
-  // modes is harmless and keeps the runstate honest.
+
+  // If the PA→ALSA bridge is already running, switch its output device IN PLACE
+  // (SIGUSR1) so connected apps keep playing — no restart, no dropped streams.
+  Mode rm;
+  qint64 pid;
+  if (readRunState(&rm, &pid) && rm == Mode::PulseToAlsa && pidAlive(pid) && liveSwitchDevice(pid))
+  {
+    emit deviceChanged(token);
+    return;
+  }
+
+  // Nothing running to signal (or the live switch failed): (re)apply so the
+  // choice takes effect when the bridge next starts.
   applyMode(currentMode(), /*force=*/true);
   emit deviceChanged(token);
 }

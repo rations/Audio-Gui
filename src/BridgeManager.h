@@ -94,6 +94,12 @@ private:
   void persistMode(Mode mode);
   void persistDevice(const QString& cardId);
 
+  // Tell the running PA→ALSA bridge to switch output device in place (write the
+  // control file + SIGUSR1), so client apps keep playing. False if it could not.
+  bool liveSwitchDevice(qint64 pid) const;
+  // Control file the bridge reads on SIGUSR1 (alongside the runtime pidfile).
+  QString ctlFilePath() const;
+
   // Runtime state (pidfile) — survives a GUI restart, cleared on reboot.
   QString runStatePath() const;
   void writeRunState(Mode mode, qint64 pid);
