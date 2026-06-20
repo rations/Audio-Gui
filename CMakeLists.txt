@@ -50,6 +50,7 @@ add_executable(audio-gui
   src/main.cpp
   src/MainWindow.cpp
   src/AlsaMixer.cpp
+  src/AlsaDevices.cpp
   src/MixerStripWidget.cpp
   src/LevelMeter.cpp
   src/BridgeManager.cpp

@@ -48,6 +48,11 @@ public:
   // Open the given ALSA card ("default" by default). Returns false on failure.
   bool open(const QString& card = QStringLiteral("default"));
 
+  // Close any current card and open another one, rebuilding the element list and
+  // poll notifiers. Used when the user switches output device. Returns false on
+  // failure (leaving the mixer closed).
+  bool reopen(const QString& card);
+
   const QVector<Element>& elements() const { return m_elements; }
 
   // Volume is 0..100 (percent of the control's range). Clamped internally.
@@ -68,6 +73,7 @@ private slots:
 private:
   void buildElements();
   void registerNotifiers();
+  void close();
 
   snd_mixer_t* m_handle = nullptr;
   QString m_card;

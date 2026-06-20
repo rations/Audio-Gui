@@ -8,11 +8,6 @@
  * sums all streams into a stereo interleaved buffer that a playback thread
  * writes to the ALSA "default" device.
  *
- * No PulseAudio binary, no PipeWire, no JACK. Only libasound + pthread.
- * Opening the ALSA "default" device picks up the dmix (software mixing, so the
- * bridge coexists with other ALSA apps), plug (rate/format conversion) and the
- * equalizer chain that AlsaTune's .asoundrc configures.
- *
  * Build:
  *   gcc -O2 -Wall -Wextra -o pa-alsa-bridge pulse_alsa_bridge.c \
  *       $(pkg-config --cflags --libs alsa) -lpthread -lm
@@ -1289,7 +1284,7 @@ static int alsa_open(const char *dev) {
     if ((err = snd_pcm_open(&g_pcm, dev, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
         fprintf(stderr,
             "pulse-alsa-bridge: cannot open ALSA device '%s': %s\n"
-            "  Check your .asoundrc / sound card (try AlsaTune's sound-card switcher).\n",
+            "  Check that a sound card is present and your ALSA config (~/.asoundrc) is valid.\n",
             dev, snd_strerror(err));
         return -1;
     }
@@ -1306,13 +1301,13 @@ static int alsa_open(const char *dev) {
         return -1;
     }
 
-    unsigned int rate = 44100;   /* match the dmix lock in .asoundrc, avoid resampling */
+    unsigned int rate = 44100;   /* requested; set_rate_near adapts to whatever the device offers */
     if ((err = snd_pcm_hw_params_set_rate_near(g_pcm, hw, &rate, 0)) < 0) {
         fprintf(stderr, "pulse-alsa-bridge: set rate: %s\n", snd_strerror(err));
         return -1;
     }
 
-    snd_pcm_uframes_t period = 1024;   /* mirror the dmix slave */
+    snd_pcm_uframes_t period = 1024;   /* default period/buffer; adapts to the device */
     snd_pcm_uframes_t bufsz  = 4096;
     snd_pcm_hw_params_set_period_size_near(g_pcm, hw, &period, 0);
     snd_pcm_hw_params_set_buffer_size_near(g_pcm, hw, &bufsz);

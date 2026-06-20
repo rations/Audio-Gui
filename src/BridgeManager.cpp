@@ -4,7 +4,10 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QProcess>
+#include <QProcessEnvironment>
+#include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTextStream>
@@ -13,6 +16,8 @@
 
 #include <csignal>
 #include <dlfcn.h>
+
+#include "AlsaDevices.h"
 
 namespace
 {
@@ -27,6 +32,7 @@ constexpr int kJackNoStartServer = 0x01; // JackNoStartServer
 constexpr int kJackProbeIntervalMs = 2000;
 
 constexpr const char* kSettingsKey = "routing/mode";
+constexpr const char* kDeviceKey = "routing/device";
 
 bool isValidMode(int v)
 {
@@ -92,6 +98,18 @@ void BridgeManager::persistMode(Mode mode)
 {
   QSettings s;
   s.setValue(QString::fromLatin1(kSettingsKey), static_cast<int>(mode));
+}
+
+QString BridgeManager::currentDevice() const
+{
+  QSettings s;
+  return s.value(QString::fromLatin1(kDeviceKey)).toString();
+}
+
+void BridgeManager::persistDevice(const QString& cardId)
+{
+  QSettings s;
+  s.setValue(QString::fromLatin1(kDeviceKey), cardId);
 }
 
 // ---- runtime pidfile -------------------------------------------------------
@@ -171,13 +189,98 @@ void BridgeManager::stopRunningBridge()
   clearRunState();
 }
 
-qint64 BridgeManager::startBridgeDetached(const QString& binary)
+qint64 BridgeManager::startBridgeDetached(const QString& binary, const QString& alsaDevice)
 {
-  qint64 pid = -1;
   // Detached: the bridge becomes independent and keeps running after the GUI
-  // exits. Explicit argv, no shell.
-  QProcess::startDetached(bridgePath(binary), QStringList{}, QCoreApplication::applicationDirPath(), &pid);
+  // exits. Explicit program/argv, no shell. A QProcess instance (not the static
+  // overload) lets us inject PULSE_BRIDGE_ALSA_DEV so the bridge opens the chosen
+  // output device.
+  QProcess p;
+  p.setProgram(bridgePath(binary));
+  p.setWorkingDirectory(QCoreApplication::applicationDirPath());
+
+  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  if (!alsaDevice.isEmpty())
+    env.insert(QStringLiteral("PULSE_BRIDGE_ALSA_DEV"), alsaDevice);
+  p.setProcessEnvironment(env);
+
+  qint64 pid = -1;
+  p.startDetached(&pid);
   return pid;
+}
+
+QString BridgeManager::resolveAlsaDevice() const
+{
+  // Map the persisted device token to a concrete ALSA device string now, so a
+  // card that came back at a different index still resolves. Unknown/empty token
+  // -> empty (the bridge falls back to "default").
+  const QString token = currentDevice();
+  if (token.isEmpty())
+    return QString();
+
+  const QVector<AlsaDevices::OutputDevice> devices = AlsaDevices::enumerateOutputs();
+  const AlsaDevices::OutputDevice* d = AlsaDevices::findByToken(devices, token);
+  if (!d)
+    return QString(); // device gone (unplugged): default keeps audio working
+  return AlsaDevices::deviceStringFor(*d);
+}
+
+void BridgeManager::ensureBaselineAsoundrc() const
+{
+  // Only bootstrap when the user has no ALSA config at all — never clobber an
+  // existing setup (theirs or the distro's).
+  const QString home = QDir::homePath();
+  const QString userRc = QDir(home).absoluteFilePath(QStringLiteral(".asoundrc"));
+  if (QFileInfo::exists(userRc) || QFileInfo::exists(QStringLiteral("/etc/asound.conf")))
+    return;
+
+  // Slave the baseline dmix/dsnoop on the internal card; fall back to hw:0 if we
+  // could not detect one. Rate/format are a sane default — the bridge requests
+  // 44100 and adapts via set_rate_near, so there is no hard coupling.
+  const QString internalId = AlsaDevices::firstInternalCardId();
+  const QString slave =
+    internalId.isEmpty() ? QStringLiteral("hw:0,0") : QStringLiteral("hw:CARD=%1,DEV=0").arg(internalId);
+  const QString ctlCard = internalId.isEmpty() ? QStringLiteral("0") : internalId;
+
+  const QString contents = QStringLiteral(
+                             "# Written by Audio-Gui: baseline software-mixing default.\n"
+                             "# Created only because no ~/.asoundrc or /etc/asound.conf existed.\n"
+                             "# Delete this file to fall back to ALSA's built-in default.\n"
+                             "pcm.!default {\n"
+                             "  type plug\n"
+                             "  slave.pcm \"audiogui_asym\"\n"
+                             "}\n"
+                             "ctl.!default {\n"
+                             "  type hw\n"
+                             "  card %1\n"
+                             "}\n"
+                             "pcm.audiogui_asym {\n"
+                             "  type asym\n"
+                             "  playback.pcm \"audiogui_dmix\"\n"
+                             "  capture.pcm \"audiogui_dsnoop\"\n"
+                             "}\n"
+                             "pcm.audiogui_dmix {\n"
+                             "  type dmix\n"
+                             "  ipc_key 1024\n"
+                             "  slave {\n"
+                             "    pcm \"%2\"\n"
+                             "    rate 48000\n"
+                             "    channels 2\n"
+                             "  }\n"
+                             "}\n"
+                             "pcm.audiogui_dsnoop {\n"
+                             "  type dsnoop\n"
+                             "  ipc_key 1025\n"
+                             "  slave.pcm \"%2\"\n"
+                             "}\n")
+                             .arg(ctlCard, slave);
+
+  // Atomic write; tolerate failure (audio still works if a usable default exists).
+  QSaveFile f(userRc);
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    return;
+  f.write(contents.toUtf8());
+  f.commit();
 }
 
 void BridgeManager::applyMode(Mode mode, bool force)
@@ -199,8 +302,16 @@ void BridgeManager::applyMode(Mode mode, bool force)
 
   switch (mode)
   {
-    case Mode::PulseToAlsa: writeRunState(mode, startBridgeDetached(QStringLiteral("pa-alsa-bridge"))); break;
-    case Mode::PulseToJack: writeRunState(mode, startBridgeDetached(QStringLiteral("pulse-jack-bridge"))); break;
+    case Mode::PulseToAlsa:
+      // Make sure a usable software-mixing "default" exists before the bridge
+      // opens it, then point the bridge at the chosen output device.
+      ensureBaselineAsoundrc();
+      writeRunState(mode, startBridgeDetached(QStringLiteral("pa-alsa-bridge"), resolveAlsaDevice()));
+      break;
+    case Mode::PulseToJack:
+      // JACK bridge routes through jackd, not an ALSA device — no device env.
+      writeRunState(mode, startBridgeDetached(QStringLiteral("pulse-jack-bridge"), QString()));
+      break;
     case Mode::PureAlsa: writeRunState(mode, -1); break; // nothing runs
   }
 
@@ -211,6 +322,18 @@ void BridgeManager::applyMode(Mode mode, bool force)
 void BridgeManager::setMode(Mode mode)
 {
   applyMode(mode, /*force=*/false);
+}
+
+void BridgeManager::setDevice(const QString& token)
+{
+  if (token == currentDevice())
+    return;
+  persistDevice(token);
+  // Restart the currently active mode so the new device takes effect live. Only
+  // the PulseToAlsa bridge consumes the device, but forcing a restart in other
+  // modes is harmless and keeps the runstate honest.
+  applyMode(currentMode(), /*force=*/true);
+  emit deviceChanged(token);
 }
 
 void BridgeManager::ensureActive()

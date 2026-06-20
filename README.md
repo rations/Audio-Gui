@@ -20,6 +20,14 @@ bridges, so apps that only speak PulseAudio still get sound.
   - **PA Bridge → JACK** — runs `pulse-jack-bridge`, exposing `pulse_bridge`
     playback ports in a JACK patchbay. Enabled only while `jackd` is running
     (detected live).
+- **Output device** — a dropdown that switches the bridge's output between the
+  detected cards (internal / USB / HDMI) **live**, without restarting the app.
+  Devices are discovered straight from `libasound` (no shelling out) and the list
+  refreshes automatically when you plug or unplug a USB interface. The mixer
+  controls follow the selected card; HDMI outputs, which usually have no mixer
+  controls, show a placeholder. The choice persists and is restored at login.
+  (Applies to the PA Bridge → ALSA path; the dropdown is disabled in the other
+  modes.)
 - **Switches** — Capture and IEC958 (S/PDIF) toggles, when the card provides them.
 - **Appearance** — a self-contained modern theme (Fusion + stylesheet) that looks the
   same on every system rather than inheriting the user's Qt/GTK theme. A dark/light
@@ -37,6 +45,16 @@ running bridge and the saved choice.
 There is **no PulseAudio server, no PipeWire** anywhere — the bridges are minimal
 PA-protocol sockets that expose just enough for apps to believe PulseAudio is
 present. Only UNIX sockets are used (no dependency on systemd or Wayland).
+
+On first run, if you have **no ALSA configuration at all** (neither `~/.asoundrc`
+nor `/etc/asound.conf`), Audio-Gui writes a baseline `~/.asoundrc` that sets up a
+software-mixing (`dmix`/`dsnoop`) `default` on your internal card, so the bridge
+and ordinary ALSA apps can share the device on any distro. If you already have
+either file it is **left untouched** — delete the generated `~/.asoundrc` to fall
+back to ALSA's built-in default.
+
+Everything runs at user privilege; opening a specific card (`hw:`/`plughw:`)
+needs only membership of the `audio` group, exactly as opening `default` does.
 
 ## Build
 

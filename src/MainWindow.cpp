@@ -14,15 +14,23 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QRadioButton>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <QTextStream>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include "AlsaDevices.h"
 #include "LevelMeter.h"
 #include "MixerStripWidget.h"
 #include "Theme.h"
+
+namespace
+{
+constexpr int kHotplugPollMs = 3000;
+} // namespace
 
 namespace
 {
@@ -82,18 +90,36 @@ MainWindow::MainWindow(QWidget* parent)
     return;
   }
 
+  // Build sections before placing them. Routing is built before Devices so the
+  // switches container (m_switchesLayout) exists when populating device controls.
   auto* central = new QWidget(this);
   auto* layout = new QVBoxLayout(central);
-  layout->addWidget(buildMixerSection());
-  layout->addWidget(buildRoutingSection());
+  QWidget* mixerSection = buildMixerSection();
+  QWidget* routingSection = buildRoutingSection();
+  QWidget* devicesSection = buildDevicesSection();
+  layout->addWidget(mixerSection);
+  layout->addWidget(devicesSection);
+  layout->addWidget(routingSection);
   layout->addStretch(1);
   layout->addWidget(buildAppearanceBar()); // bottom-left appearance controls
   setCentralWidget(central);
 
+  // Open the mixer on the card backing the combo's current selection (which the
+  // devices section already resolved, falling back to an available card if the
+  // saved device is currently absent) and fill the controls.
+  reopenMixerForDevice(m_deviceCombo->currentData().toString());
   applyMeterThemeColors();
 
   connect(&m_mixer, &AlsaMixer::changed, this, &MainWindow::onMixerChanged);
   connect(&m_bridges, &BridgeManager::jackAvailabilityChanged, this, &MainWindow::onJackAvailabilityChanged);
+  connect(&m_bridges, &BridgeManager::modeChanged, this, [this](BridgeManager::Mode) { updateDeviceComboEnabled(); });
+
+  // Re-scan cards periodically so USB/HDMI plug/unplug updates the list live —
+  // no udev, no daemon, all in-process.
+  m_hotplugTimer = new QTimer(this);
+  m_hotplugTimer->setInterval(kHotplugPollMs);
+  connect(m_hotplugTimer, &QTimer::timeout, this, &MainWindow::refreshDevices);
+  m_hotplugTimer->start();
 
   // Make the saved/default routing active if it isn't already (the bridge may
   // have been started at login and must be left running), and keep the login
@@ -101,6 +127,7 @@ MainWindow::MainWindow(QWidget* parent)
   m_bridges.ensureActive();
   ensureAutostartEntry();
   onJackAvailabilityChanged(m_bridges.jackAvailable());
+  updateDeviceComboEnabled();
 }
 
 QWidget* MainWindow::buildMixerSection()
@@ -108,22 +135,37 @@ QWidget* MainWindow::buildMixerSection()
   auto* group = new QGroupBox(tr("Mixer"), this);
   auto* col = new QVBoxLayout(group);
 
-  // One strip per element that exposes a volume (Master, Headphone, Speaker,
-  // Mic, Mic Boost). Switch-only controls go in the routing section instead.
-  for (const AlsaMixer::Element& e : m_mixer.elements())
-  {
-    if (!e.hasVolume)
-      continue;
-    auto* strip = new MixerStripWidget(&m_mixer, e, group);
-    m_strips.push_back(strip);
-    col->addWidget(strip);
-  }
+  // Volume strips are rebuilt into this layout whenever the output device (and
+  // thus the card) changes — see populateMixerControls().
+  m_stripsLayout = new QVBoxLayout();
+  col->addLayout(m_stripsLayout);
+
+  m_mixerPlaceholder = new QLabel(tr("No mixer controls for this output."), group);
+  m_mixerPlaceholder->setAlignment(Qt::AlignCenter);
+  m_mixerPlaceholder->hide();
+  m_stripsLayout->addWidget(m_mixerPlaceholder);
 
   m_meter = new LevelMeter(group);
   col->addSpacing(6);
   col->addWidget(new QLabel(tr("Output level"), group));
   col->addWidget(m_meter);
 
+  return group;
+}
+
+QWidget* MainWindow::buildDevicesSection()
+{
+  auto* group = new QGroupBox(tr("Output device"), this);
+  auto* col = new QVBoxLayout(group);
+
+  m_deviceCombo = new QComboBox(group);
+  m_deviceCombo->setToolTip(tr("Switch the audio output device live"));
+  col->addWidget(m_deviceCombo);
+
+  // Fill the list and select the persisted device.
+  refreshDevices();
+
+  connect(m_deviceCombo, &QComboBox::currentIndexChanged, this, &MainWindow::onDeviceSelected);
   return group;
 }
 
@@ -184,23 +226,11 @@ QWidget* MainWindow::buildRoutingSection()
   col->addWidget(m_jackRadio);
 
   // ---- Switch-only ALSA controls (Capture, IEC958) ----
-  bool addedSep = false;
-  for (const AlsaMixer::Element& e : m_mixer.elements())
-  {
-    if (e.hasVolume || !e.hasSwitch)
-      continue;
-    if (!addedSep)
-    {
-      col->addSpacing(6);
-      addedSep = true;
-    }
-    auto* box = new QCheckBox(e.label, group);
-    box->setChecked(m_mixer.switchOn(e));
-    const AlsaMixer::Element captured = e;
-    connect(box, &QCheckBox::toggled, this, [this, captured](bool on) { m_mixer.setSwitchOn(captured, on); });
-    col->addWidget(box);
-    m_switches.push_back({e, box});
-  }
+  // These are card-specific, so they are (re)built into this layout by
+  // populateMixerControls() whenever the output device changes.
+  col->addSpacing(6);
+  m_switchesLayout = new QVBoxLayout();
+  col->addLayout(m_switchesLayout);
 
   return group;
 }
@@ -286,4 +316,124 @@ void MainWindow::onJackAvailabilityChanged(bool available)
   m_jackRadio->setEnabled(available);
   m_jackRadio->setToolTip(available ? tr("Route PulseAudio-compat audio to JACK ports")
                                     : tr("Start jackd to enable JACK routing"));
+}
+
+void MainWindow::populateMixerControls()
+{
+  // Tear down the previous card's widgets (the placeholder is kept and toggled).
+  qDeleteAll(m_strips);
+  m_strips.clear();
+  for (const SwitchBox& s : m_switches)
+    delete s.box;
+  m_switches.clear();
+
+  QWidget* stripParent = m_stripsLayout->parentWidget();
+  QWidget* switchParent = m_switchesLayout->parentWidget();
+
+  // One strip per element that exposes a volume (Master, Headphone, Speaker, ...).
+  bool anyVolume = false;
+  for (const AlsaMixer::Element& e : m_mixer.elements())
+  {
+    if (!e.hasVolume)
+      continue;
+    auto* strip = new MixerStripWidget(&m_mixer, e, stripParent);
+    m_strips.push_back(strip);
+    m_stripsLayout->addWidget(strip);
+    anyVolume = true;
+  }
+  m_mixerPlaceholder->setVisible(!anyVolume);
+
+  // Switch-only controls (Capture, IEC958) for this card.
+  for (const AlsaMixer::Element& e : m_mixer.elements())
+  {
+    if (e.hasVolume || !e.hasSwitch)
+      continue;
+    auto* box = new QCheckBox(e.label, switchParent);
+    box->setChecked(m_mixer.switchOn(e));
+    const AlsaMixer::Element captured = e;
+    connect(box, &QCheckBox::toggled, this, [this, captured](bool on) { m_mixer.setSwitchOn(captured, on); });
+    m_switchesLayout->addWidget(box);
+    m_switches.push_back({e, box});
+  }
+}
+
+void MainWindow::reopenMixerForDevice(const QString& token)
+{
+  // Internal / empty -> the ALSA "default" mixer; a specific card -> its controls.
+  const QString cardId = AlsaDevices::cardIdFromToken(token);
+  const QString card = cardId.isEmpty() ? QStringLiteral("default") : QStringLiteral("hw:CARD=%1").arg(cardId);
+  m_mixer.reopen(card); // on failure the element list is empty -> placeholder shows
+  populateMixerControls();
+}
+
+void MainWindow::onDeviceSelected(int index)
+{
+  if (index < 0 || !m_deviceCombo)
+    return;
+  const QString token = m_deviceCombo->itemData(index).toString();
+  m_bridges.setDevice(token); // restarts the bridge on the new device (no-op if unchanged)
+  reopenMixerForDevice(token); // mixer follows the device
+}
+
+void MainWindow::refreshDevices()
+{
+  const QVector<AlsaDevices::OutputDevice> devices = AlsaDevices::enumerateOutputs();
+
+  // Cheap change detection: only rebuild when the set of devices actually changed.
+  auto signature = [](const QVector<AlsaDevices::OutputDevice>& v) {
+    QStringList s;
+    for (const AlsaDevices::OutputDevice& d : v)
+      s << d.cardId + QLatin1Char(':') + QString::number(d.pcmIndex);
+    return s;
+  };
+  const bool initialBuild = m_deviceCombo->count() == 0;
+  if (!initialBuild && signature(devices) == signature(m_devices))
+    return;
+  m_devices = devices;
+
+  // Preserve the user's selection across the rebuild; on first fill use the
+  // persisted choice. Internal devices are stored as "" (== ALSA "default").
+  const QString want = initialBuild ? m_bridges.currentDevice() : m_deviceCombo->currentData().toString();
+
+  QSignalBlocker block(m_deviceCombo);
+  m_deviceCombo->clear();
+  int wantIndex = -1;
+  int internalIndex = -1;
+  for (const AlsaDevices::OutputDevice& d : devices)
+  {
+    const QString token = AlsaDevices::tokenFor(d);
+    m_deviceCombo->addItem(d.displayName, token);
+    const int idx = m_deviceCombo->count() - 1;
+    if (token == want && wantIndex < 0)
+      wantIndex = idx;
+    if (internalIndex < 0 && d.category == AlsaDevices::Category::Internal)
+      internalIndex = idx;
+  }
+
+  const int select = wantIndex >= 0 ? wantIndex : (internalIndex >= 0 ? internalIndex : 0);
+  if (m_deviceCombo->count() > 0)
+    m_deviceCombo->setCurrentIndex(select);
+
+  // On a live refresh (not the initial build): if the device that was selected
+  // vanished (unplug), switch the running bridge + mixer to the new selection so
+  // audio keeps playing. On the initial build we leave the saved preference
+  // intact — the bridge resolves a missing device to "default" on its own, so a
+  // device merely absent at startup is not forgotten.
+  const QString chosen = m_deviceCombo->currentData().toString();
+  if (!initialBuild && m_deviceCombo->count() > 0 && chosen != m_bridges.currentDevice())
+  {
+    m_bridges.setDevice(chosen);
+    reopenMixerForDevice(chosen);
+  }
+}
+
+void MainWindow::updateDeviceComboEnabled()
+{
+  if (!m_deviceCombo)
+    return;
+  // The device only routes the PA→ALSA bridge; disable it in the other modes.
+  const bool on = m_bridges.currentMode() == BridgeManager::Mode::PulseToAlsa;
+  m_deviceCombo->setEnabled(on);
+  m_deviceCombo->setToolTip(on ? tr("Switch the audio output device live")
+                               : tr("Device selection applies to the PA → ALSA bridge"));
 }
