@@ -100,8 +100,7 @@ private:
 
   // The dmix/dsnoop "default" asoundrc body, slaved to the given playback/capture
   // PCMs with ctl on the given card.
-  QString asoundrcContents(const QString& playbackSlave, const QString& captureSlave,
-                           const QString& ctlCard) const;
+  QString asoundrcContents(const QString& playbackSlave, const QString& captureSlave, const QString& ctlCard) const;
 
   // Write the managed ~/.asoundrc, but only when it is absent or a file we wrote
   // ourselves — never clobber the user's or distro's hand-rolled config.
