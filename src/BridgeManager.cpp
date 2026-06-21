@@ -251,62 +251,122 @@ QString BridgeManager::resolveAlsaDevice() const
   return AlsaDevices::deviceStringFor(*d);
 }
 
-void BridgeManager::ensureBaselineAsoundrc() const
+QString BridgeManager::asoundrcContents(const QString& playbackSlave, const QString& captureSlave,
+                                        const QString& ctlCard) const
 {
-  // Only bootstrap when the user has no ALSA config at all — never clobber an
-  // existing setup (theirs or the distro's).
-  const QString home = QDir::homePath();
-  const QString userRc = QDir(home).absoluteFilePath(QStringLiteral(".asoundrc"));
-  if (QFileInfo::exists(userRc) || QFileInfo::exists(QStringLiteral("/etc/asound.conf")))
-    return;
+  // type plug "default" -> asym(playback dmix, capture dsnoop): software mixing so
+  // several apps share the card, with plug adapting rate/format/channels. Rate is
+  // a sane default — the bridge requests 44100 and adapts via set_rate_near.
+  return QStringLiteral(
+           "# Written by Audio-Gui: software-mixing default output.\n"
+           "# Managed by Audio-Gui — rewritten when you pick a Pure-ALSA device.\n"
+           "# Delete this file to fall back to ALSA's built-in default.\n"
+           "pcm.!default {\n"
+           "  type plug\n"
+           "  slave.pcm \"audiogui_asym\"\n"
+           "}\n"
+           "ctl.!default {\n"
+           "  type hw\n"
+           "  card %1\n"
+           "}\n"
+           "pcm.audiogui_asym {\n"
+           "  type asym\n"
+           "  playback.pcm \"audiogui_dmix\"\n"
+           "  capture.pcm \"audiogui_dsnoop\"\n"
+           "}\n"
+           "pcm.audiogui_dmix {\n"
+           "  type dmix\n"
+           "  ipc_key 1024\n"
+           "  slave {\n"
+           "    pcm \"%2\"\n"
+           "    rate 48000\n"
+           "    channels 2\n"
+           "  }\n"
+           "}\n"
+           "pcm.audiogui_dsnoop {\n"
+           "  type dsnoop\n"
+           "  ipc_key 1025\n"
+           "  slave.pcm \"%3\"\n"
+           "}\n")
+    .arg(ctlCard, playbackSlave, captureSlave);
+}
 
-  // Slave the baseline dmix/dsnoop on the internal card; fall back to hw:0 if we
-  // could not detect one. Rate/format are a sane default — the bridge requests
-  // 44100 and adapts via set_rate_near, so there is no hard coupling.
-  const QString internalId = AlsaDevices::firstInternalCardId();
-  const QString slave =
-    internalId.isEmpty() ? QStringLiteral("hw:0,0") : QStringLiteral("hw:CARD=%1,DEV=0").arg(internalId);
-  const QString ctlCard = internalId.isEmpty() ? QStringLiteral("0") : internalId;
+void BridgeManager::writeAsoundrc(const QString& playbackSlave, const QString& captureSlave,
+                                  const QString& ctlCard) const
+{
+  const QString userRc = QDir(QDir::homePath()).absoluteFilePath(QStringLiteral(".asoundrc"));
 
-  const QString contents = QStringLiteral(
-                             "# Written by Audio-Gui: baseline software-mixing default.\n"
-                             "# Created only because no ~/.asoundrc or /etc/asound.conf existed.\n"
-                             "# Delete this file to fall back to ALSA's built-in default.\n"
-                             "pcm.!default {\n"
-                             "  type plug\n"
-                             "  slave.pcm \"audiogui_asym\"\n"
-                             "}\n"
-                             "ctl.!default {\n"
-                             "  type hw\n"
-                             "  card %1\n"
-                             "}\n"
-                             "pcm.audiogui_asym {\n"
-                             "  type asym\n"
-                             "  playback.pcm \"audiogui_dmix\"\n"
-                             "  capture.pcm \"audiogui_dsnoop\"\n"
-                             "}\n"
-                             "pcm.audiogui_dmix {\n"
-                             "  type dmix\n"
-                             "  ipc_key 1024\n"
-                             "  slave {\n"
-                             "    pcm \"%2\"\n"
-                             "    rate 48000\n"
-                             "    channels 2\n"
-                             "  }\n"
-                             "}\n"
-                             "pcm.audiogui_dsnoop {\n"
-                             "  type dsnoop\n"
-                             "  ipc_key 1025\n"
-                             "  slave.pcm \"%2\"\n"
-                             "}\n")
-                             .arg(ctlCard, slave);
+  // Only ever rewrite a file we wrote ourselves (or none at all): a hand-rolled
+  // ~/.asoundrc (the user's or the distro's) is left untouched.
+  if (QFileInfo::exists(userRc))
+  {
+    QFile r(userRc);
+    if (!r.open(QIODevice::ReadOnly))
+      return;
+    const QString existing = QString::fromUtf8(r.readAll());
+    r.close();
+    if (!existing.contains(QStringLiteral("Written by Audio-Gui")))
+      return;
+  }
 
   // Atomic write; tolerate failure (audio still works if a usable default exists).
   QSaveFile f(userRc);
   if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
     return;
-  f.write(contents.toUtf8());
+  f.write(asoundrcContents(playbackSlave, captureSlave, ctlCard).toUtf8());
   f.commit();
+}
+
+void BridgeManager::ensureBaselineAsoundrc() const
+{
+  // Only bootstrap when the user has no ALSA config at all — never clobber an
+  // existing setup (theirs or the distro's). Slave the baseline dmix/dsnoop on
+  // the internal card; fall back to hw:0 if we could not detect one.
+  const QString userRc = QDir(QDir::homePath()).absoluteFilePath(QStringLiteral(".asoundrc"));
+  if (QFileInfo::exists(userRc) || QFileInfo::exists(QStringLiteral("/etc/asound.conf")))
+    return;
+
+  const QString internalId = AlsaDevices::firstInternalCardId();
+  const QString slave =
+    internalId.isEmpty() ? QStringLiteral("hw:0,0") : QStringLiteral("hw:CARD=%1,DEV=0").arg(internalId);
+  const QString ctlCard = internalId.isEmpty() ? QStringLiteral("0") : internalId;
+
+  // File is known absent here, so write straight out (no managed-file guard).
+  QSaveFile f(userRc);
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    return;
+  f.write(asoundrcContents(slave, slave, ctlCard).toUtf8());
+  f.commit();
+}
+
+void BridgeManager::applyPureAlsaDefault() const
+{
+  // Pure ALSA runs no bridge: "selecting a device" means pointing ALSA's default
+  // PCM at the chosen card so native ALSA apps started afterwards play through it.
+  // Capture stays on the internal card so opening "default" to record still works
+  // when the pick is a playback-only HDMI/USB output.
+  const QString internalId = AlsaDevices::firstInternalCardId();
+  const QString internalSlave =
+    internalId.isEmpty() ? QStringLiteral("hw:0,0") : QStringLiteral("hw:CARD=%1,DEV=0").arg(internalId);
+
+  QString playbackSlave = internalSlave;
+  QString ctlCard = internalId.isEmpty() ? QStringLiteral("0") : internalId;
+
+  const QString token = currentDevice();
+  if (!token.isEmpty())
+  {
+    const QVector<AlsaDevices::OutputDevice> devices = AlsaDevices::enumerateOutputs();
+    if (const AlsaDevices::OutputDevice* d = AlsaDevices::findByToken(devices, token))
+    {
+      if (d->category != AlsaDevices::Category::Internal && !d->cardId.isEmpty())
+      {
+        playbackSlave = QStringLiteral("hw:CARD=%1,DEV=%2").arg(d->cardId).arg(d->pcmIndex);
+        ctlCard = d->cardId;
+      }
+    }
+  }
+
+  writeAsoundrc(playbackSlave, internalSlave, ctlCard);
 }
 
 void BridgeManager::applyMode(Mode mode, bool force)
@@ -338,7 +398,12 @@ void BridgeManager::applyMode(Mode mode, bool force)
       // JACK bridge routes through jackd, not an ALSA device — no device env.
       writeRunState(mode, startBridgeDetached(QStringLiteral("pulse-jack-bridge"), QString()));
       break;
-    case Mode::PureAlsa: writeRunState(mode, -1); break; // nothing runs
+    case Mode::PureAlsa:
+      // No bridge runs; point ALSA's default PCM at the chosen output device so
+      // native ALSA apps play through it (effective on app restart).
+      applyPureAlsaDefault();
+      writeRunState(mode, -1);
+      break;
   }
 
   persistMode(mode);

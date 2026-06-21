@@ -431,9 +431,22 @@ void MainWindow::updateDeviceComboEnabled()
 {
   if (!m_deviceCombo)
     return;
-  // The device only routes the PA→ALSA bridge; disable it in the other modes.
-  const bool on = m_bridges.currentMode() == BridgeManager::Mode::PulseToAlsa;
-  m_deviceCombo->setEnabled(on);
-  m_deviceCombo->setToolTip(on ? tr("Switch the audio output device live")
-                               : tr("Device selection applies to the PA → ALSA bridge"));
+  // PA→ALSA switches live; Pure ALSA repoints ALSA's default (applies on app
+  // restart). Only PA→JACK ignores the device (audio routes through jackd).
+  const BridgeManager::Mode mode = m_bridges.currentMode();
+  switch (mode)
+  {
+    case BridgeManager::Mode::PulseToAlsa:
+      m_deviceCombo->setEnabled(true);
+      m_deviceCombo->setToolTip(tr("Switch the audio output device live"));
+      break;
+    case BridgeManager::Mode::PureAlsa:
+      m_deviceCombo->setEnabled(true);
+      m_deviceCombo->setToolTip(tr("Set the default ALSA output device (applies to apps started afterwards)"));
+      break;
+    case BridgeManager::Mode::PulseToJack:
+      m_deviceCombo->setEnabled(false);
+      m_deviceCombo->setToolTip(tr("Device selection does not apply when routing to JACK"));
+      break;
+  }
 }

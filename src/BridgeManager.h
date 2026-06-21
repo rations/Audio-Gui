@@ -50,7 +50,9 @@ public:
   bool jackAvailable() const { return m_jackAvailable; }
 
   // The persisted output-device choice as a stable token ("<cardId>:<pcmIndex>").
-  // Empty means the ALSA "default" PCM (Internal). Only PulseToAlsa honours it.
+  // Empty means the ALSA "default" PCM (Internal). PulseToAlsa points the bridge
+  // at it (live); PureAlsa points ALSA's default PCM at it (effective on app
+  // restart). PulseToJack ignores it (audio routes through jackd).
   QString currentDevice() const;
 
   // Ensure the saved/default mode is active without needless restarts: if the
@@ -64,8 +66,9 @@ public slots:
   // User picked a routing option: apply it now and persist the choice.
   void setMode(Mode mode);
 
-  // User picked an output device (stable token; empty = "default"): persist it
-  // and restart the bridge so it takes effect live.
+  // User picked an output device (stable token; empty = "default"): persist it.
+  // PulseToAlsa switches the running bridge live; PureAlsa rewrites ALSA's
+  // default PCM (effective when apps restart).
   void setDevice(const QString& token);
 
 signals:
@@ -89,6 +92,20 @@ private:
   // Write a baseline dmix/dsnoop ~/.asoundrc, but only if the user has no ALSA
   // config yet (~/.asoundrc and /etc/asound.conf both absent). Never overwrites.
   void ensureBaselineAsoundrc() const;
+
+  // Pure-ALSA device routing: rewrite ALSA's default PCM to play through the
+  // persisted device (capture stays on the internal card). Native ALSA apps
+  // started afterwards open the new default — not live, by design (no snd-aloop).
+  void applyPureAlsaDefault() const;
+
+  // The dmix/dsnoop "default" asoundrc body, slaved to the given playback/capture
+  // PCMs with ctl on the given card.
+  QString asoundrcContents(const QString& playbackSlave, const QString& captureSlave,
+                           const QString& ctlCard) const;
+
+  // Write the managed ~/.asoundrc, but only when it is absent or a file we wrote
+  // ourselves — never clobber the user's or distro's hand-rolled config.
+  void writeAsoundrc(const QString& playbackSlave, const QString& captureSlave, const QString& ctlCard) const;
 
   // Persisted choices.
   void persistMode(Mode mode);
