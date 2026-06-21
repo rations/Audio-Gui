@@ -17,10 +17,42 @@
 #include <csignal>
 #include <dlfcn.h>
 
+#include <alsa/asoundlib.h>
+
 #include "AlsaDevices.h"
 
 namespace
 {
+
+// The channel count to fix the dmix slave at for a given hw device. dmix opens
+// the card in one fixed config, so it must be one the hardware actually accepts:
+// many pro USB interfaces (e.g. UMC204HD) expose playback as 4-channel only, and
+// forcing stereo there misframes every sample into white noise. Prefer 2 when the
+// device supports it (the common case), else fall back to its minimum. The plug
+// wrapping "default" upmixes ordinary stereo apps to this count. Defaults to 2 if
+// the device cannot be probed.
+int dmixChannelsFor(const QString& hwName)
+{
+  snd_pcm_t* pcm = nullptr;
+  if (snd_pcm_open(&pcm, hwName.toUtf8().constData(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0)
+    return 2;
+
+  snd_pcm_hw_params_t* hw = nullptr;
+  snd_pcm_hw_params_alloca(&hw);
+
+  unsigned int channels = 2;
+  if (snd_pcm_hw_params_any(pcm, hw) >= 0)
+  {
+    if (snd_pcm_hw_params_test_channels(pcm, hw, 2) != 0)
+    {
+      unsigned int minc = 2;
+      if (snd_pcm_hw_params_get_channels_min(hw, &minc) >= 0 && minc > 0)
+        channels = minc;
+    }
+  }
+  snd_pcm_close(pcm);
+  return static_cast<int>(channels);
+}
 
 // Minimal mirror of the libjack types/values we need to probe a running server,
 // so we can dlopen libjack without pulling in <jack/jack.h> at build time.
@@ -256,7 +288,9 @@ QString BridgeManager::asoundrcContents(const QString& playbackSlave, const QStr
 {
   // type plug "default" -> asym(playback dmix, capture dsnoop): software mixing so
   // several apps share the card, with plug adapting rate/format/channels. Rate is
-  // a sane default — the bridge requests 44100 and adapts via set_rate_near.
+  // a sane default — the bridge requests 44100 and adapts via set_rate_near. The
+  // dmix channel count must match what the hardware accepts (see dmixChannelsFor).
+  const int channels = dmixChannelsFor(playbackSlave);
   return QStringLiteral(
            "# Written by Audio-Gui: software-mixing default output.\n"
            "# Managed by Audio-Gui — rewritten when you pick a Pure-ALSA device.\n"
@@ -280,7 +314,7 @@ QString BridgeManager::asoundrcContents(const QString& playbackSlave, const QStr
            "  slave {\n"
            "    pcm \"%2\"\n"
            "    rate 48000\n"
-           "    channels 2\n"
+           "    channels %4\n"
            "  }\n"
            "}\n"
            "pcm.audiogui_dsnoop {\n"
@@ -288,7 +322,8 @@ QString BridgeManager::asoundrcContents(const QString& playbackSlave, const QStr
            "  ipc_key 1025\n"
            "  slave.pcm \"%3\"\n"
            "}\n")
-    .arg(ctlCard, playbackSlave, captureSlave);
+    .arg(ctlCard, playbackSlave, captureSlave)
+    .arg(channels);
 }
 
 void BridgeManager::writeAsoundrc(const QString& playbackSlave, const QString& captureSlave,
@@ -371,6 +406,17 @@ void BridgeManager::applyPureAlsaDefault() const
 
 void BridgeManager::applyMode(Mode mode, bool force)
 {
+  // Guarantee a usable ALSA "default" exists on every entry — before the no-op
+  // return below. A first run, or a user who deleted ~/.asoundrc, must never be
+  // left with a broken "default" (silent or erroring apps with no clue why).
+  // Both writers are idempotent and never clobber a hand-rolled config. JACK
+  // routes through jackd, so it keeps the prior behaviour of not bootstrapping a
+  // dmix default.
+  if (mode == Mode::PulseToAlsa)
+    ensureBaselineAsoundrc();
+  else if (mode == Mode::PureAlsa)
+    applyPureAlsaDefault();
+
   // No-op only if the requested mode is what is *actually* running right now
   // (a bridge started at login, say) — never based on the saved-mode fallback,
   // or a fresh launch with nothing running would skip starting the bridge.
@@ -389,9 +435,7 @@ void BridgeManager::applyMode(Mode mode, bool force)
   switch (mode)
   {
     case Mode::PulseToAlsa:
-      // Make sure a usable software-mixing "default" exists before the bridge
-      // opens it, then point the bridge at the chosen output device.
-      ensureBaselineAsoundrc();
+      // "default" already ensured above; point the bridge at the chosen device.
       writeRunState(mode, startBridgeDetached(QStringLiteral("pa-alsa-bridge"), resolveAlsaDevice()));
       break;
     case Mode::PulseToJack:
@@ -399,9 +443,7 @@ void BridgeManager::applyMode(Mode mode, bool force)
       writeRunState(mode, startBridgeDetached(QStringLiteral("pulse-jack-bridge"), QString()));
       break;
     case Mode::PureAlsa:
-      // No bridge runs; point ALSA's default PCM at the chosen output device so
-      // native ALSA apps play through it (effective on app restart).
-      applyPureAlsaDefault();
+      // "default" already pointed at the chosen device above; no bridge runs.
       writeRunState(mode, -1);
       break;
   }

@@ -79,6 +79,13 @@ MainWindow::MainWindow(QWidget* parent)
 {
   setWindowTitle(tr("Audio Control"));
 
+  // Make the saved/default routing active first. This also bootstraps a usable
+  // ALSA "default" (~/.asoundrc) when the user has none — and the mixer below
+  // opens "default", so it must exist first. Otherwise a missing default makes
+  // m_mixer.open() fail and we bail out (below) before ever writing it: the one
+  // case that needs regeneration is the one that would skip it.
+  m_bridges.ensureActive();
+
   if (!m_mixer.open())
   {
     auto* msg = new QLabel(tr("Could not open the ALSA mixer (\"default\").\n"
@@ -121,10 +128,8 @@ MainWindow::MainWindow(QWidget* parent)
   connect(m_hotplugTimer, &QTimer::timeout, this, &MainWindow::refreshDevices);
   m_hotplugTimer->start();
 
-  // Make the saved/default routing active if it isn't already (the bridge may
-  // have been started at login and must be left running), and keep the login
-  // autostart entry up to date.
-  m_bridges.ensureActive();
+  // Routing was already made active at the top of the constructor (before the
+  // mixer opened "default"). Keep the login autostart entry up to date.
   ensureAutostartEntry();
   onJackAvailabilityChanged(m_bridges.jackAvailable());
   updateDeviceComboEnabled();
@@ -318,7 +323,7 @@ void MainWindow::onJackAvailabilityChanged(bool available)
                                     : tr("Start jackd to enable JACK routing"));
 }
 
-void MainWindow::populateMixerControls()
+void MainWindow::populateMixerControls(bool suppressControls)
 {
   // Tear down the previous card's widgets (the placeholder is kept and toggled).
   qDeleteAll(m_strips);
@@ -326,6 +331,14 @@ void MainWindow::populateMixerControls()
   for (const SwitchBox& s : m_switches)
     delete s.box;
   m_switches.clear();
+
+  // USB interfaces (and any other suppressed card) show only the placeholder:
+  // their software controls don't drive the hardware, so a slider would mislead.
+  if (suppressControls)
+  {
+    m_mixerPlaceholder->setVisible(true);
+    return;
+  }
 
   QWidget* stripParent = m_stripsLayout->parentWidget();
   QWidget* switchParent = m_switchesLayout->parentWidget();
@@ -362,8 +375,15 @@ void MainWindow::reopenMixerForDevice(const QString& token)
   // Internal / empty -> the ALSA "default" mixer; a specific card -> its controls.
   const QString cardId = AlsaDevices::cardIdFromToken(token);
   const QString card = cardId.isEmpty() ? QStringLiteral("default") : QStringLiteral("hw:CARD=%1").arg(cardId);
+
+  // USB interfaces expose only nominal capture controls (gain is set by hardware
+  // knobs), so their sliders do nothing useful — show the placeholder like HDMI.
+  const QVector<AlsaDevices::OutputDevice> devices = AlsaDevices::enumerateOutputs();
+  const AlsaDevices::OutputDevice* d = AlsaDevices::findByToken(devices, token);
+  const bool suppressControls = d && d->category == AlsaDevices::Category::Usb;
+
   m_mixer.reopen(card); // on failure the element list is empty -> placeholder shows
-  populateMixerControls();
+  populateMixerControls(suppressControls);
 }
 
 void MainWindow::onDeviceSelected(int index)

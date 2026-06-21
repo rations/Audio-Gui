@@ -45,8 +45,10 @@ private:
   void applyMeterThemeColors();
 
   // Rebuild the card-specific controls (volume strips + switches) for the mixer's
-  // currently open card, showing a placeholder when the card has no controls.
-  void populateMixerControls();
+  // currently open card, showing a placeholder when the card has no controls (or
+  // when suppressControls forces the placeholder, e.g. USB interfaces whose
+  // sliders are nominal — gain is set by hardware knobs).
+  void populateMixerControls(bool suppressControls = false);
   // Re-open the mixer on the card backing the given output-device id, then
   // repopulate the controls. Empty id / Internal -> ALSA "default".
   void reopenMixerForDevice(const QString& cardId);
