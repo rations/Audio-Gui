@@ -78,7 +78,7 @@ Grab a release `audio-gui-<version>.tar.gz`, unpack it, and run the installer:
 ```sh
 tar xzf audio-gui-<version>.tar.gz
 cd Audio-Gui
-sh install.sh        # or: chmod +x install.sh && ./install.sh
+chmod +x install.sh && ./install.sh
 ```
 
 `install.sh` installs everything **per-user, no root** (binaries to `~/.local/bin`,
