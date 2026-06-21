@@ -69,6 +69,14 @@ if command -v strip >/dev/null 2>&1; then
   strip --strip-unneeded "$PKG"/bin/* 2>/dev/null || true
 fi
 
+# Source tree for the build-from-source fallback in install.sh. Everything
+# needed to `cmake -B build -S source`.
+mkdir -p -- "$PKG/source"
+cp -- "$ROOT/CMakeLists.txt" "$PKG/source/"
+cp -- "$ROOT/pulse_alsa_bridge.c" "$ROOT/pulse_jack_bridge.c" "$PKG/source/"
+cp -r -- "$ROOT/src" "$ROOT/include" "$PKG/source/"
+info "staged source/ (build-from-source fallback)"
+
 # Scripts, desktop template, and docs.
 install -m 0755 -- "$ROOT/packaging/install.sh" "$PKG/install.sh"
 install -m 0755 -- "$ROOT/packaging/uninstall.sh" "$PKG/uninstall.sh"

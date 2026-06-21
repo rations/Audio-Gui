@@ -44,7 +44,7 @@ running bridge and the saved choice.
 
 There is **no PulseAudio server, no PipeWire** anywhere — the bridges are minimal
 PA-protocol sockets that expose just enough for apps to believe PulseAudio is
-present. Only UNIX sockets are used (no dependency on systemd or Wayland).
+present. Only UNIX sockets are used (no dependency on systemd).
 
 The `pa-alsa-bridge` implements both **playback** and **capture**: besides games and
 browsers, it negotiates the **extended format API** used by players like VLC (which
@@ -71,6 +71,47 @@ back to ALSA's built-in default.
 Everything runs at user privilege; opening a specific card (`hw:`/`plughw:`)
 needs only membership of the `audio` group, exactly as opening `default` does.
 
+## Install (release tarball)
+
+Grab a release `audio-gui-<version>.tar.gz`, unpack it, and run the installer:
+
+```sh
+tar xzf audio-gui-<version>.tar.gz
+cd Audio-Gui
+sh install.sh        # or: chmod +x install.sh && ./install.sh
+```
+
+`install.sh` installs everything **per-user, no root** (binaries to `~/.local/bin`,
+a menu entry to `~/.local/share/applications`) — only the dependency step uses
+`sudo` to pull the runtime packages via your distro's package manager
+(apt/dnf/yum/pacman/zypper/apk). It also writes a generic `~/.asoundrc`, backing
+up any existing one to `~/.asoundrc.bak`. Useful flags:
+
+- `--from-source` — build from the bundled source instead of the prebuilt binaries.
+- `--no-deps` — don't touch the package manager (install dependencies yourself).
+- `--no-asoundrc` — leave `~/.asoundrc` alone.
+- `PREFIX=/usr/local ./install.sh` — system-wide instead of `~/.local`.
+
+The tarball ships **prebuilt binaries plus the full source**. By default
+`install.sh` uses the prebuilt binaries when they resolve their libraries on your
+system; if they can't (different glibc/Qt6), it **automatically builds from the
+bundled source** instead. Remove with `./uninstall.sh` (`--purge` also drops
+saved settings).
+
+### Prebuilt binary requirements
+
+The released binaries are built on **Debian 12 (bookworm)**, so they need:
+
+| Requirement | Minimum version |
+|---|---|
+| glibc | **≥ 2.36** (Debian 12 / Ubuntu 22.04 / Fedora 37 era or newer) |
+| Qt6 Widgets | **≥ 6.4** |
+| ALSA | `libasound2` + `alsa-utils` |
+| JACK *(optional)* | any `libjack` — only for JACK routing |
+
+On older systems (e.g. RHEL 8's glibc 2.28) the prebuilt binaries won't run — use
+`./install.sh --from-source`, which builds against your own libraries.
+
 ## Build
 
 ```sh
@@ -91,6 +132,19 @@ executable, so keep them in the same directory.
 
 If libjack is missing at build time, `pulse-jack-bridge` is skipped and the GUI
 keeps the JACK option disabled.
+
+### Creating a release
+
+```sh
+./release-tarball.sh          # version read from the VERSION file
+./release-tarball.sh 0.2.0    # or override it for a one-off build
+```
+
+This builds in Release mode and produces `audio-gui-<version>.tar.gz` (prebuilt
+binaries + bundled source + `install.sh`/`uninstall.sh`) that unpacks to a single
+`Audio-Gui/` directory. Bump [`VERSION`](VERSION) when cutting a release. For the
+widest compatibility, run it on the **oldest** system you support (the project
+ships releases built on Debian 12) so the binaries' glibc/Qt6 floor stays low.
 
 ## Run
 
