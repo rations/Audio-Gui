@@ -13,13 +13,14 @@ bridges, so apps that only speak PulseAudio still get sound.
   (e.g. `amixer`, media keys) are reflected live.
 - **Output level meter** — a live stereo peak meter fed by whichever bridge is
   running (the bridge publishes its mixed peak in a shared-memory page).
+  Output meters do not work in ALSA (no bridge)
 - **Audio options** — a 3-way routing choice (the two bridges are
   mutually exclusive, they bind the same PA socket):
   - **PA Bridge → ALSA** *(default)* — runs `pa-alsa-bridge`.
-  - **Pure ALSA (no bridge)** — nothing runs; only native-ALSA apps get sound.
+  - **ALSA (no bridge)** — nothing runs; only native-ALSA apps get sound.
   - **PA Bridge → JACK** — runs `pulse-jack-bridge`, exposing `pulse_bridge`
-    playback ports in a JACK patchbay. Enabled only while `jackd` is running
-    (detected live).
+    playback ports in a JACK patchbay. Needs to be connected manually in Jack Graph, Qjackctl  
+    Enabled only while `jackd` is running (detected live).
 - **Output device** — a dropdown that switches the bridge's output between the
   detected cards (internal / USB / HDMI) **live**, without restarting the app.
   Devices are discovered straight from `libasound` (no shelling out) and the list
@@ -32,7 +33,7 @@ bridges, so apps that only speak PulseAudio still get sound.
 - **Appearance** — a self-contained modern theme (Fusion + stylesheet) that looks the
   same on every system rather than inheriting the user's Qt/GTK theme. A dark/light
   toggle (dark by default) and an accent colour (green / orange / blue / yellow) sit at
-  the top of the window; both choices persist.
+  the bottom of the window; both choices persist.
 
 The bridge runs **independently of the GUI**: it keeps playing after you close the
 window, the chosen mode is remembered, and it is brought back up at login by an
