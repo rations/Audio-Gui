@@ -3,6 +3,9 @@
 build*/
 cmake-build-*/
 
+# Release artifacts (produced by release-tarball.sh)
+audio-gui-*.tar.gz
+
 # CMake artifacts (if anyone configures in-tree)
 CMakeCache.txt
 CMakeFiles/
