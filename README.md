@@ -46,6 +46,14 @@ There is **no PulseAudio server, no PipeWire** anywhere — the bridges are mini
 PA-protocol sockets that expose just enough for apps to believe PulseAudio is
 present. Only UNIX sockets are used (no dependency on systemd or Wayland).
 
+The `pa-alsa-bridge` implements both **playback** and **capture**: besides games and
+browsers, it answers sink-input introspection (so players like VLC that query their
+own stream stay connected) and exposes a **monitor source** (`alsa_sink.monitor`) with
+real record streams, so screen recorders and capture apps (Simple Screen Recorder,
+OBS, Audacity, voice chat) can record the mixed output. The monitor is taken
+post-mix, so it is unaffected by live output-device switching. Record streams are
+resampled/converted to whatever sample rate and format the recording app requests.
+
 On first run, if you have **no ALSA configuration at all** (neither `~/.asoundrc`
 nor `/etc/asound.conf`), Audio-Gui writes a baseline `~/.asoundrc` that sets up a
 software-mixing (`dmix`/`dsnoop`) `default` on your internal card, so the bridge

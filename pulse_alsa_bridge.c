@@ -72,6 +72,9 @@
 #define PA_CMD_SET_DEFAULT_SINK         44u   /* verified PA enum position 44 */
 #define PA_CMD_SET_DEFAULT_SOURCE       45u
 #define PA_CMD_KILL_SINK_INPUT          49u
+#define PA_CMD_GET_RECORD_LATENCY       57u   /* verified PA enum position 57 */
+#define PA_CMD_CORK_RECORD_STREAM       58u   /* verified PA enum position 58 */
+#define PA_CMD_FLUSH_RECORD_STREAM      59u   /* verified PA enum position 59 */
 #define PA_CMD_PREBUF_PLAYBACK_STREAM   60u   /* verified PA enum position 60 */
 #define PA_CMD_REQUEST                  61u   /* server→client: request N bytes */
 #define PA_CMD_MOVE_SINK_INPUT          67u
@@ -119,10 +122,14 @@
 
 #define MAX_STREAMS   8
 #define MAX_CLIENTS   8
+#define MAX_RECORD_STREAMS 4 /* monitor-source capture clients (SSR, OBS, ...) */
 #define HDR_LEN       20   /* 5 × uint32 packet header */
 #define TS_BUF        4096 /* tagstruct write buffer */
 #define CONV_FRAMES   8192 /* scratch buffer frames for audio conversion */
 #define RB_BYTES      (512u * 1024u) /* 512 KB ring buffer per channel/stream */
+#define REC_RB_BYTES  (256u * 1024u) /* monitor capture ring per record stream */
+#define REC_TX_CHUNK  16384u         /* max payload bytes per record packet sent */
+#define REC_FLUSH     2048u          /* resampler flush granularity (frames) */
 #define PLAY_MAX_FRAMES 8192 /* cap for playback-thread mix/write chunk */
 
 /* Buffer sizes computed from ALSA parameters after connection */
@@ -290,6 +297,39 @@ static ring_t   *rb_R[MAX_STREAMS];
 /* Main-thread-only scratch buffers for PCM conversion */
 static float conv_L[CONV_FRAMES];
 static float conv_R[CONV_FRAMES];
+
+/* ----------------------------------------------------------------------
+ * Record (monitor capture) streams
+ *
+ * The playback thread tees its mixed output into rb (producer); the main
+ * thread drains rb and pushes PA memblocks to the client (consumer) — the
+ * mirror image of the playback path. The ring is the only cross-thread
+ * state; the resampler fields are playback-thread-only, the tx fields are
+ * main-thread-only.
+ * ---------------------------------------------------------------------- */
+typedef struct {
+    volatile int active;     /* set last on create, cleared first on delete */
+    int          client_idx;
+    int          client_fd;
+    uint8_t      format;     /* PA_SAMPLE_S16LE or PA_SAMPLE_FLOAT32LE */
+    uint8_t      channels;   /* 1 or 2 (client-negotiated) */
+    uint8_t      corked;     /* 1 = paused: stop teeing audio */
+    uint32_t     rate;       /* client-negotiated rate (Hz) */
+    uint32_t     fragsize;   /* client's preferred fragment size (bytes) */
+    ring_t      *rb;         /* client-format PCM bytes, playback→main */
+
+    /* linear resampler state (g_rate -> rate), playback thread only */
+    double       phase;      /* fractional position within the current segment */
+    float        prevL, prevR;
+
+    /* outbound packet assembly, main thread only */
+    uint8_t     *tx;         /* HDR_LEN + REC_TX_CHUNK */
+    uint32_t     tx_len;     /* bytes queued in tx (0 = idle) */
+    uint32_t     tx_sent;    /* bytes already written to the socket */
+    uint64_t     delivered;  /* total PCM bytes pushed to the client (read index) */
+} RecordStream;
+
+static RecordStream rstreams[MAX_RECORD_STREAMS];
 
 /* ======================================================================
  * Client receive state
@@ -551,6 +591,41 @@ static int alloc_stream(void) {
     for (int i = 0; i < MAX_STREAMS; i++)
         if (!streams[i].active) return i;
     return -1;
+}
+
+static int alloc_record_stream(void) {
+    for (int i = 0; i < MAX_RECORD_STREAMS; i++)
+        if (!rstreams[i].active) return i;
+    return -1;
+}
+
+/* ----------------------------------------------------------------------
+ * Shared tagstruct writers for the introspection descriptors below.
+ * ---------------------------------------------------------------------- */
+
+/* cvolume at PA_VOLUME_NORM (0x00010000) for every channel. */
+static void tw_cvolume_norm(TsW *t, uint8_t ch) {
+    t->data[t->pos++] = PA_TAG_CVOLUME;
+    t->data[t->pos++] = ch;
+    for (uint8_t i = 0; i < ch; i++) {
+        t->data[t->pos++] = 0x00; t->data[t->pos++] = 0x01;
+        t->data[t->pos++] = 0x00; t->data[t->pos++] = 0x00;
+    }
+}
+
+/* A single PCM format_info (encoding=1) with an empty proplist. */
+static void tw_format_info_pcm(TsW *t) {
+    t->data[t->pos++] = PA_TAG_FORMAT_INFO;   /* 'f' */
+    t->data[t->pos++] = PA_TAG_U8;            /* 'B' */
+    t->data[t->pos++] = 1u;                   /* PA_ENCODING_PCM = 1 */
+    t->data[t->pos++] = PA_TAG_PROPLIST;      /* 'P' */
+    t->data[t->pos++] = PA_TAG_STRING_NULL;   /* 'N' empty proplist */
+}
+
+/* An empty proplist ('P' immediately followed by the string-null terminator). */
+static void tw_proplist_empty(TsW *t) {
+    t->data[t->pos++] = PA_TAG_PROPLIST;
+    t->data[t->pos++] = PA_TAG_STRING_NULL;
 }
 
 /* ======================================================================
@@ -898,8 +973,8 @@ static void send_sink_info(int fd, uint32_t tag, uint32_t proto) {
         rep.data[rep.pos++] = 0x00; rep.data[rep.pos++] = 0x00;
     }
     tw_bool(&rep, 0);                        /* mute = false */
-    tw_u32(&rep, 0xFFFFFFFFu);               /* monitor source index: none */
-    tw_str(&rep, NULL);                      /* monitor source name: none */
+    tw_u32(&rep, 0u);                        /* monitor source index: alsa_sink.monitor */
+    tw_str(&rep, "alsa_sink.monitor");       /* monitor source name */
     tw_usec(&rep, 0u);                       /* latency */
     tw_str(&rep, "alsa");                    /* driver */
     tw_u32(&rep, 0u);                        /* flags */
@@ -937,6 +1012,135 @@ static void send_sink_info(int fd, uint32_t tag, uint32_t proto) {
         rep.data[rep.pos++] = PA_TAG_STRING_NULL;   /* 'N' empty proplist */
     }
     send_cmd(fd, &rep);
+}
+
+/* Append one sink-input descriptor (our playback stream `slot`) to `rep`, with
+ * the version-gated layout of PA's sink_input_fill_tagstruct (protocol-native.c
+ * 3402-3443). Some clients (e.g. VLC) create a playback stream and then call
+ * GET_SINK_INPUT_INFO on its index to track it — returning a malformed/empty
+ * reply tears the connection down, which is why those apps "don't work". */
+static void put_sink_input_info(TsW *rep, uint32_t proto, int slot) {
+    PaStream *s = &streams[slot];
+    uint8_t ch = (s->channels < 2) ? 1u : 2u;
+    tw_u32(rep, (uint32_t)slot);             /* sink input index */
+    tw_str(rep, "Playback Stream");          /* media name */
+    tw_u32(rep, 0xFFFFFFFFu);                /* owner module: none */
+    tw_u32(rep, 0xFFFFFFFFu);                /* client: none */
+    tw_u32(rep, 0u);                         /* sink index */
+    tw_sample_spec(rep, s->format, ch, g_rate);
+    tw_channel_map(rep, ch);
+    tw_cvolume_norm(rep, ch);
+    tw_usec(rep, 0u);                         /* latency */
+    tw_usec(rep, 0u);                         /* sink latency */
+    tw_str(rep, "copy");                      /* resample method */
+    tw_str(rep, "alsa");                      /* driver */
+    if (proto >= 11u) tw_bool(rep, 0);                       /* muted */
+    if (proto >= 13u) tw_proplist_empty(rep);                /* proplist */
+    if (proto >= 19u) tw_bool(rep, s->corked ? 1 : 0);       /* corked */
+    if (proto >= 20u) { tw_bool(rep, 1); tw_bool(rep, 1); }  /* has_volume, volume_writable */
+    if (proto >= 21u) tw_format_info_pcm(rep);               /* format */
+}
+
+/* GET_SINK_INPUT_INFO: one descriptor for the requested stream, or NOENTITY. */
+static void send_sink_input_info(int fd, uint32_t tag, uint32_t proto, uint32_t idx) {
+    if (idx >= MAX_STREAMS || !streams[idx].active) {
+        send_error(fd, tag, PA_ERR_NOENTITY);
+        return;
+    }
+    TsW rep = {0};
+    tw_u32(&rep, PA_CMD_REPLY);
+    tw_u32(&rep, tag);
+    put_sink_input_info(&rep, proto, (int)idx);
+    send_cmd(fd, &rep);
+}
+
+/* GET_SINK_INPUT_INFO_LIST: every active stream, then an empty reply as EOL. */
+static void send_sink_input_info_list(int fd, uint32_t tag, uint32_t proto) {
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (!streams[i].active) continue;
+        TsW rep = {0};
+        tw_u32(&rep, PA_CMD_REPLY);
+        tw_u32(&rep, tag);
+        put_sink_input_info(&rep, proto, i);
+        send_cmd(fd, &rep);
+    }
+    send_reply_empty(fd, tag);
+}
+
+/* A minimal client descriptor (protocol-native.c client_fill_tagstruct). */
+static void put_client_info(TsW *rep, uint32_t proto) {
+    tw_u32(rep, 0u);                         /* client index */
+    tw_str(rep, "pulse-alsa-bridge client"); /* application name */
+    tw_u32(rep, 0xFFFFFFFFu);                /* owner module: none */
+    tw_str(rep, "alsa");                     /* driver */
+    if (proto >= 13u) tw_proplist_empty(rep);
+}
+
+/* Send our monitor source descriptor (PA's source_fill_tagstruct,
+ * protocol-native.c 3239-3312). Note the format list is gated on proto >= 22
+ * for sources (vs >= 21 for sinks). */
+static void send_source_info(int fd, uint32_t tag, uint32_t proto) {
+    TsW rep = {0};
+    tw_u32(&rep, PA_CMD_REPLY);
+    tw_u32(&rep, tag);
+
+    tw_u32(&rep, 0u);                         /* source index */
+    tw_str(&rep, "alsa_sink.monitor");        /* name */
+    tw_str(&rep, "Monitor of ALSA Audio");    /* description */
+    tw_sample_spec(&rep, (uint8_t)PA_SAMPLE_S16LE, 2, g_rate);
+    tw_channel_map(&rep, 2);
+    tw_u32(&rep, 0xFFFFFFFFu);                /* owner module: none */
+    tw_cvolume_norm(&rep, 2);
+    tw_bool(&rep, 0);                         /* mute = false */
+    tw_u32(&rep, 0u);                         /* monitor_of sink index */
+    tw_str(&rep, "alsa_sink");                /* monitor_of sink name */
+    tw_usec(&rep, 0u);                        /* latency */
+    tw_str(&rep, "alsa");                     /* driver */
+    tw_u32(&rep, 0u);                         /* flags */
+
+    if (proto >= 13u) { tw_proplist_empty(&rep); tw_usec(&rep, 0u); }
+    if (proto >= 15u) {
+        rep.data[rep.pos++] = PA_TAG_VOLUME;
+        rep.data[rep.pos++] = 0x00; rep.data[rep.pos++] = 0x01;
+        rep.data[rep.pos++] = 0x00; rep.data[rep.pos++] = 0x00;  /* base_volume = NORM */
+        tw_u32(&rep, 0u);                     /* state: PA_SOURCE_RUNNING = 0 */
+        tw_u32(&rep, 65537u);                 /* n_volume_steps */
+        tw_u32(&rep, 0xFFFFFFFFu);            /* card: none */
+    }
+    if (proto >= 16u) { tw_u32(&rep, 0u); tw_str(&rep, NULL); }  /* n_ports, active_port */
+    if (proto >= 22u) {
+        rep.data[rep.pos++] = PA_TAG_U8;
+        rep.data[rep.pos++] = 1u;            /* n_formats = 1 */
+        tw_format_info_pcm(&rep);
+    }
+    send_cmd(fd, &rep);
+}
+
+/* Append one source-output descriptor (our record stream `slot`) to `rep`
+ * (PA's source_output_fill_tagstruct, protocol-native.c 3445-3484). */
+static void put_source_output_info(TsW *rep, uint32_t proto, int slot) {
+    RecordStream *r = &rstreams[slot];
+    uint8_t ch = (r->channels < 2) ? 1u : 2u;
+    tw_u32(rep, (uint32_t)slot);             /* source output index */
+    tw_str(rep, "Record Stream");            /* media name */
+    tw_u32(rep, 0xFFFFFFFFu);                /* owner module: none */
+    tw_u32(rep, 0xFFFFFFFFu);                /* client: none */
+    tw_u32(rep, 0u);                         /* source index */
+    tw_sample_spec(rep, r->format, ch, r->rate);
+    tw_channel_map(rep, ch);
+    tw_usec(rep, 0u);                         /* latency */
+    tw_usec(rep, 0u);                         /* source latency */
+    tw_str(rep, "copy");                      /* resample method */
+    tw_str(rep, "alsa");                      /* driver */
+    if (proto >= 13u) tw_proplist_empty(rep);
+    if (proto >= 19u) tw_bool(rep, r->corked ? 1 : 0);
+    if (proto >= 22u) {
+        tw_cvolume_norm(rep, ch);
+        tw_bool(rep, 0);                      /* muted */
+        tw_bool(rep, 1);                      /* has_volume */
+        tw_bool(rep, 1);                      /* volume_writable */
+        tw_format_info_pcm(rep);
+    }
 }
 
 /* ======================================================================
@@ -980,6 +1184,145 @@ static void cmd_extension(Client *cl, TsR *ts, uint32_t tag) {
         /* READ (1): empty list in one packet; SUBSCRIBE (4), WRITE (2), etc.: ack */
         send_reply_empty(cl->fd, tag);
     }
+}
+
+/* ======================================================================
+ * Record streams (monitor capture)
+ *
+ * A client records the sink's monitor by creating a record stream; the
+ * playback thread tees its mix into the stream's ring (rec_feed), and the
+ * poll loop pushes that PCM back to the client as memblocks.
+ * ====================================================================== */
+
+static void cmd_create_record_stream(Client *cl, TsR *ts, uint32_t tag) {
+    uint8_t  fmt = (uint8_t)PA_SAMPLE_S16LE;
+    uint8_t  ch  = 2;
+    uint32_t rate = g_rate;
+
+    /* Request layout: [name(str) if proto<13], sample_spec, channel_map,
+     * source_index(u32), source_name(str), maxlength(u32), corked(bool),
+     * fragsize(u32), then version-gated flags we don't need.  We only read up
+     * to fragsize — everything we negotiate comes from the sample_spec. */
+    const char *name = NULL;
+    if (cl->proto < 13u) tr_str(ts, &name);  /* name (unused) */
+    if (tr_sample_spec(ts, &fmt, &ch, &rate) < 0) {
+        send_error(cl->fd, tag, PA_ERR_NOTSUPPORTED);
+        return;
+    }
+    if (fmt != PA_SAMPLE_S16LE && fmt != PA_SAMPLE_FLOAT32LE) {
+        send_error(cl->fd, tag, PA_ERR_NOTSUPPORTED);
+        return;
+    }
+    if (ch < 1 || ch > 2) ch = 2;
+    if (rate < 4000u || rate > 192000u) {
+        send_error(cl->fd, tag, PA_ERR_NOTSUPPORTED);
+        return;
+    }
+
+    uint32_t maxlength = 0, fragsize = 0;
+    const char *src_name = NULL;
+    int start_corked = 0;
+    tr_skip(ts);                 /* channel_map */
+    tr_skip(ts);                 /* source_index (u32) */
+    tr_str(ts, &src_name);       /* source_name */
+    tr_u32(ts, &maxlength);
+    if (ts->pos < ts->len)       /* corked (bool) */
+        start_corked = (ts->data[ts->pos++] != PA_TAG_BOOL_FALSE);
+    tr_u32(ts, &fragsize);
+
+    int slot = alloc_record_stream();
+    if (slot < 0) {
+        send_error(cl->fd, tag, PA_ERR_INTERNAL);
+        return;
+    }
+    RecordStream *r = &rstreams[slot];
+    ring_reset(r->rb);
+    r->client_idx = (int)(cl - clients);
+    r->client_fd  = cl->fd;
+    r->format     = fmt;
+    r->channels   = ch;
+    r->corked     = (uint8_t)start_corked;
+    r->rate       = rate;
+    r->phase      = 0.0;
+    r->prevL = r->prevR = 0.0f;
+    r->tx_len = r->tx_sent = 0;
+    r->delivered  = 0;
+    /* fragsize drives how much we send per packet; clamp to a sane window. */
+    if (fragsize == 0u || fragsize == 0xFFFFFFFFu || fragsize > REC_TX_CHUNK)
+        fragsize = REC_TX_CHUNK;
+    r->fragsize = fragsize;
+    __sync_synchronize();        /* publish fields before active = 1 */
+    r->active = 1;
+
+    /* Reply (protocol-native.c command_create_record_stream, 2400-2430). The
+     * client validates the echoed sample_spec against its request, so echo it
+     * back exactly; rec_feed converts the mix to this spec. */
+    uint32_t ring_max = REC_RB_BYTES;
+    TsW rep = {0};
+    tw_u32(&rep, PA_CMD_REPLY);
+    tw_u32(&rep, tag);
+    tw_u32(&rep, (uint32_t)slot);    /* stream index (channel) */
+    tw_u32(&rep, (uint32_t)slot);    /* source_output index */
+    if (cl->proto >= 9u) {
+        tw_u32(&rep, ring_max);      /* maxlength */
+        tw_u32(&rep, fragsize);      /* fragsize */
+    }
+    if (cl->proto >= 12u) {
+        tw_sample_spec(&rep, fmt, ch, rate);
+        tw_channel_map(&rep, ch);
+        tw_u32(&rep, 0u);            /* source index */
+        tw_str(&rep, "alsa_sink.monitor");
+        tw_bool(&rep, 0);            /* not suspended */
+    }
+    if (cl->proto >= 13u)
+        tw_usec(&rep, 0u);           /* configured_source_latency */
+    if (cl->proto >= 22u)
+        tw_format_info_pcm(&rep);
+    send_cmd(cl->fd, &rep);
+
+    if (g_debug)
+        fprintf(stderr, "pulse-alsa-bridge: record stream %d created: fmt=%u ch=%u rate=%u corked=%d\n",
+                slot, fmt, ch, rate, start_corked);
+}
+
+static void cmd_delete_record_stream(Client *cl, TsR *ts, uint32_t tag) {
+    uint32_t idx = 0;
+    if (tr_u32(ts, &idx) == 0 && idx < MAX_RECORD_STREAMS) {
+        if (rstreams[idx].active && rstreams[idx].client_idx == (int)(cl - clients)) {
+            rstreams[idx].active = 0;   /* playback thread stops teeing */
+            rstreams[idx].tx_len = rstreams[idx].tx_sent = 0;
+        }
+    }
+    send_reply_empty(cl->fd, tag);
+}
+
+/* GET_RECORD_LATENCY: mirror cmd_get_playback_latency for capture streams
+ * (protocol-native.c command_get_record_latency). Clients poll this for timing. */
+static void cmd_get_record_latency(Client *cl, TsR *ts, uint32_t tag) {
+    uint32_t idx = 0;
+    tr_u32(ts, &idx);   /* the client's timeval follows; we don't need it */
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    uint64_t read_idx = 0, write_idx = 0;
+    if (idx < MAX_RECORD_STREAMS && rstreams[idx].active) {
+        RecordStream *r = &rstreams[idx];
+        read_idx  = r->delivered;                          /* bytes handed to client */
+        write_idx = r->delivered + ring_read_space(r->rb); /* + still buffered */
+    }
+
+    TsW rep = {0};
+    tw_u32(&rep, PA_CMD_REPLY);
+    tw_u32(&rep, tag);
+    tw_usec(&rep, 0u);      /* monitor latency */
+    tw_usec(&rep, 0u);      /* source latency */
+    tw_bool(&rep, idx < MAX_RECORD_STREAMS && rstreams[idx].active && !rstreams[idx].corked);
+    tw_timeval(&rep, &now); /* remote_time */
+    tw_timeval(&rep, &now); /* local_time */
+    tw_u64(&rep, 'r', write_idx);  /* write_index (PA_TAG_S64) */
+    tw_u64(&rep, 'r', read_idx);   /* read_index  (PA_TAG_S64) */
+    send_cmd(cl->fd, &rep);
 }
 
 /* ======================================================================
@@ -1031,20 +1374,70 @@ static void dispatch(Client *cl, uint32_t channel,
         break;
     }
 
-    /* Record stream: stub with NOTIMPLEMENTED so games don't hang */
+    /* Record streams: capture the sink monitor (parecord, SSR, OBS, ...) */
     case PA_CMD_CREATE_RECORD_STREAM:
-    case PA_CMD_DELETE_RECORD_STREAM:
-        send_error(cl->fd, tag, PA_ERR_NOTIMPLEMENTED);
+        cmd_create_record_stream(cl, &ts, tag);
         break;
+    case PA_CMD_DELETE_RECORD_STREAM:
+        cmd_delete_record_stream(cl, &ts, tag);
+        break;
+    case PA_CMD_GET_RECORD_LATENCY:
+        cmd_get_record_latency(cl, &ts, tag);
+        break;
+    case PA_CMD_CORK_RECORD_STREAM: {
+        uint32_t idx = 0;
+        tr_u32(&ts, &idx);
+        int corked = 1;
+        if (ts.pos < ts.len)
+            corked = (ts.data[ts.pos++] != PA_TAG_BOOL_FALSE);
+        if (idx < MAX_RECORD_STREAMS && rstreams[idx].active)
+            rstreams[idx].corked = (uint8_t)corked;
+        send_reply_empty(cl->fd, tag);
+        break;
+    }
+    case PA_CMD_FLUSH_RECORD_STREAM: {
+        uint32_t idx = 0;
+        tr_u32(&ts, &idx);
+        if (idx < MAX_RECORD_STREAMS && rstreams[idx].active) {
+            ring_reset(rstreams[idx].rb);
+            rstreams[idx].tx_len = rstreams[idx].tx_sent = 0;
+        }
+        send_reply_empty(cl->fd, tag);
+        break;
+    }
 
-    /* No sources/capture: return NOENTITY for single-item queries, empty for lists */
+    /* Source info: our one monitor source (alsa_sink.monitor) */
     case PA_CMD_GET_SOURCE_INFO:
-    case PA_CMD_GET_SOURCE_OUTPUT_INFO:
-        send_error(cl->fd, tag, PA_ERR_NOENTITY);
+        send_source_info(cl->fd, tag, cl->proto);
         break;
     case PA_CMD_GET_SOURCE_INFO_LIST:
+        send_source_info(cl->fd, tag, cl->proto);
+        send_reply_empty(cl->fd, tag);  /* EOL */
+        break;
+    case PA_CMD_GET_SOURCE_OUTPUT_INFO: {
+        uint32_t idx = 0;
+        tr_u32(&ts, &idx);
+        if (idx < MAX_RECORD_STREAMS && rstreams[idx].active) {
+            TsW rep = {0};
+            tw_u32(&rep, PA_CMD_REPLY);
+            tw_u32(&rep, tag);
+            put_source_output_info(&rep, cl->proto, (int)idx);
+            send_cmd(cl->fd, &rep);
+        } else {
+            send_error(cl->fd, tag, PA_ERR_NOENTITY);
+        }
+        break;
+    }
     case PA_CMD_GET_SOURCE_OUTPUT_INFO_LIST:
-        send_reply_empty(cl->fd, tag);
+        for (int i = 0; i < MAX_RECORD_STREAMS; i++) {
+            if (!rstreams[i].active) continue;
+            TsW rep = {0};
+            tw_u32(&rep, PA_CMD_REPLY);
+            tw_u32(&rep, tag);
+            put_source_output_info(&rep, cl->proto, i);
+            send_cmd(cl->fd, &rep);
+        }
+        send_reply_empty(cl->fd, tag);  /* EOL */
         break;
 
     /* Sink info: return a real descriptor so clients can create streams */
@@ -1094,6 +1487,28 @@ static void dispatch(Client *cl, uint32_t channel,
         break;
     }
 
+    /* Sink-input info: a real descriptor per playback stream (VLC and other
+     * players introspect their own stream after creating it). */
+    case PA_CMD_GET_SINK_INPUT_INFO: {
+        uint32_t idx = 0;
+        tr_u32(&ts, &idx);
+        send_sink_input_info(cl->fd, tag, cl->proto, idx);
+        break;
+    }
+    case PA_CMD_GET_SINK_INPUT_INFO_LIST:
+        send_sink_input_info_list(cl->fd, tag, cl->proto);
+        break;
+
+    /* Client info: a single minimal client descriptor */
+    case PA_CMD_GET_CLIENT_INFO: {
+        TsW rep = {0};
+        tw_u32(&rep, PA_CMD_REPLY);
+        tw_u32(&rep, tag);
+        put_client_info(&rep, cl->proto);
+        send_cmd(cl->fd, &rep);
+        break;
+    }
+
     /* Acknowledge-only commands */
     case PA_CMD_DRAIN_PLAYBACK_STREAM:
     case PA_CMD_PREBUF_PLAYBACK_STREAM:
@@ -1105,9 +1520,6 @@ static void dispatch(Client *cl, uint32_t channel,
     case PA_CMD_SET_SINK_INPUT_MUTE:
     case PA_CMD_MOVE_SINK_INPUT:
     case PA_CMD_KILL_SINK_INPUT:
-    case PA_CMD_GET_CLIENT_INFO:
-    case PA_CMD_GET_SINK_INPUT_INFO:
-    case PA_CMD_GET_SINK_INPUT_INFO_LIST:
         send_reply_empty(cl->fd, tag);
         break;
 
@@ -1154,6 +1566,13 @@ static void close_client(Client *cl) {
             streams[i].active = 0;
             if (g_debug)
                 fprintf(stderr, "pulse-alsa-bridge: stream %d: ring buffer empty → immediate deactivate\n", i);
+        }
+    }
+    /* Record streams have no audio to drain to ALSA — drop them at once. */
+    for (int i = 0; i < MAX_RECORD_STREAMS; i++) {
+        if (rstreams[i].active && rstreams[i].client_idx == idx) {
+            rstreams[i].active = 0;
+            rstreams[i].tx_len = rstreams[i].tx_sent = 0;
         }
     }
     close(cl->fd);
@@ -1217,6 +1636,112 @@ static int read_client(Client *cl) {
     }
 }
 
+/* Push buffered monitor audio to each record client. Consumer side of the
+ * record SPSC ring; runs on the main thread only. A packet (header + PCM) is
+ * built into the stream's tx buffer and written non-blocking; a partial write
+ * resumes on the next call, so the byte stream never desyncs. On a full socket
+ * the write yields EAGAIN and we retry later (the ring drops oldest if it
+ * overflows, so a slow reader can never stall playback). */
+static void pump_record_streams(void) {
+    for (int i = 0; i < MAX_RECORD_STREAMS; i++) {
+        RecordStream *r = &rstreams[i];
+        if (!r->active) continue;
+
+        /* Start a new packet only when the previous one is fully flushed. */
+        if (r->tx_len == r->tx_sent) {
+            size_t avail = ring_read_space(r->rb);
+            uint32_t bps = (r->format == PA_SAMPLE_S16LE) ? 2u : 4u;
+            uint32_t framebytes = bps * r->channels;
+            uint32_t cap = (r->fragsize < REC_TX_CHUNK) ? r->fragsize : REC_TX_CHUNK;
+            uint32_t want = (avail < cap) ? (uint32_t)avail : cap;
+            want -= want % framebytes;            /* whole frames only */
+            if (want == 0) continue;
+
+            uint32_t *h = (uint32_t *)(void *)r->tx;
+            h[0] = htonl(want);
+            h[1] = htonl((uint32_t)i);            /* channel = record stream index */
+            h[2] = 0; h[3] = 0; h[4] = 0;         /* offset 0, seek PA_SEEK_RELATIVE */
+            ring_read(r->rb, (char *)(r->tx + HDR_LEN), want);
+            r->tx_len  = HDR_LEN + want;
+            r->tx_sent = 0;
+            r->delivered += want;
+        }
+
+        while (r->tx_sent < r->tx_len) {
+            ssize_t n = write(r->client_fd, r->tx + r->tx_sent, r->tx_len - r->tx_sent);
+            if (n > 0) {
+                r->tx_sent += (uint32_t)n;
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;                            /* socket full: finish next time */
+            } else {
+                r->active = 0;                    /* write error: drop the stream */
+                r->tx_len = r->tx_sent = 0;
+                break;
+            }
+        }
+        if (r->tx_sent == r->tx_len)
+            r->tx_len = r->tx_sent = 0;
+    }
+}
+
+/* ======================================================================
+ * Monitor capture feed (playback thread → record ring)
+ * ====================================================================== */
+
+/* Write one [-1,1] sample to *p in the record stream's format. */
+static inline void put_sample(uint8_t *p, uint8_t fmt, float v) {
+    if (v >  1.0f) v =  1.0f;
+    if (v < -1.0f) v = -1.0f;
+    if (fmt == PA_SAMPLE_S16LE) {
+        int16_t s = (int16_t)lrintf(v * 32767.0f);
+        memcpy(p, &s, 2);
+    } else {
+        memcpy(p, &v, 4);
+    }
+}
+
+/* Tee N frames of the stereo float mix (at g_rate) into one record stream,
+ * linear-resampling to the stream's rate, down/keeping channels, converting to
+ * its format.  The resampler phase/prev carry across blocks for continuity.
+ * Producer side of the SPSC ring; runs on the playback thread only. */
+static void rec_feed(RecordStream *r, const float *inL, const float *inR, snd_pcm_uframes_t N) {
+    const uint32_t bps        = (r->format == PA_SAMPLE_S16LE) ? 2u : 4u;
+    const uint32_t framebytes = bps * r->channels;
+    const double   step       = (double)g_rate / (double)r->rate; /* input frames / output frame */
+
+    uint8_t  obuf[REC_FLUSH * 2u * 4u];
+    uint32_t ob = 0;
+    double   ph = r->phase;
+    float    pL = r->prevL, pR = r->prevR;
+
+    for (snd_pcm_uframes_t n = 0; n < N; n++) {
+        float cL = inL[n], cR = inR[n];
+        while (ph < 1.0) {
+            float f = (float)ph;
+            float l = pL + (cL - pL) * f;
+            float r2 = pR + (cR - pR) * f;
+            if (r->channels == 1) {
+                put_sample(obuf + ob, r->format, 0.5f * (l + r2));
+            } else {
+                put_sample(obuf + ob,       r->format, l);
+                put_sample(obuf + ob + bps, r->format, r2);
+            }
+            ob += framebytes;
+            if (ob + framebytes > sizeof(obuf)) {
+                ring_write(r->rb, (char *)obuf, ob);
+                ob = 0;
+            }
+            ph += step;
+        }
+        ph -= 1.0;
+        pL = cL; pR = cR;
+    }
+    if (ob) ring_write(r->rb, (char *)obuf, ob);
+    r->phase = ph;
+    r->prevL = pL;
+    r->prevR = pR;
+}
+
 /* ======================================================================
  * ALSA playback thread
  *
@@ -1272,7 +1797,9 @@ static void *play_loop(void *arg) {
             }
         }
 
-        /* Soft clip + float→S16 interleave, tracking the block peak for the meter */
+        /* Soft clip + float→S16 interleave, tracking the block peak for the meter.
+         * The clipped values are written back to outL/outR so the monitor feed
+         * sees exactly what is sent to the hardware. */
         float peakL = 0.0f, peakR = 0.0f;
         for (snd_pcm_uframes_t i = 0; i < N; i++) {
             float l = outL[i], r = outR[i];
@@ -1286,8 +1813,16 @@ static void *play_loop(void *arg) {
             if (ar > peakR) peakR = ar;
             inter[2 * i]     = (int16_t)lrintf(l * 32767.0f);
             inter[2 * i + 1] = (int16_t)lrintf(r * 32767.0f);
+            outL[i] = l;
+            outR[i] = r;
         }
         peak_publish(peakL, peakR);
+
+        /* Tee the mix to any monitor-capture clients (parecord, SSR, OBS, ...). */
+        for (int i = 0; i < MAX_RECORD_STREAMS; i++) {
+            if (rstreams[i].active && !rstreams[i].corked)
+                rec_feed(&rstreams[i], outL, outR, N);
+        }
 
         snd_pcm_sframes_t w = snd_pcm_writei(g_pcm, inter, N);
         if (w < 0) {
@@ -1557,6 +2092,18 @@ int main(int argc, char *argv[]) {
         ring_mlock(rb_R[i]);
     }
 
+    /* Allocate monitor-capture rings and packet buffers up front, so create/
+     * delete just toggle the slot (no alloc/free races with the playback thread). */
+    for (int i = 0; i < MAX_RECORD_STREAMS; i++) {
+        rstreams[i].rb = ring_create(REC_RB_BYTES);
+        rstreams[i].tx = malloc(HDR_LEN + REC_TX_CHUNK);
+        if (!rstreams[i].rb || !rstreams[i].tx) {
+            fprintf(stderr, "pulse-alsa-bridge: record buffer alloc failed\n");
+            goto err_alsa;
+        }
+        ring_mlock(rstreams[i].rb);
+    }
+
     /* Discover PA socket path */
     find_socket_path(g_socket_path, sizeof(g_socket_path));
 
@@ -1641,6 +2188,9 @@ int main(int argc, char *argv[]) {
                 send_request(streams[i].client_fd, i, BUF_TLENGTH);
         }
 
+        /* Push captured monitor audio to any record clients. */
+        pump_record_streams();
+
         /* New connections */
         if (pfds[0].revents & POLLIN) {
             int cfd = accept(srv_fd, NULL, NULL);
@@ -1684,6 +2234,10 @@ int main(int argc, char *argv[]) {
         ring_free(rb_L[i]);
         ring_free(rb_R[i]);
     }
+    for (int i = 0; i < MAX_RECORD_STREAMS; i++) {
+        ring_free(rstreams[i].rb);
+        free(rstreams[i].tx);
+    }
     return 0;
 
 err_alsa:
@@ -1696,6 +2250,10 @@ err_alsa:
     for (int i = 0; i < MAX_STREAMS; i++) {
         ring_free(rb_L[i]);
         ring_free(rb_R[i]);
+    }
+    for (int i = 0; i < MAX_RECORD_STREAMS; i++) {
+        ring_free(rstreams[i].rb);
+        free(rstreams[i].tx);
     }
     return 1;
 }
