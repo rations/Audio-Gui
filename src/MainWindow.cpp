@@ -181,7 +181,7 @@ QWidget* MainWindow::buildRoutingSection()
 
   // ---- 3-way routing radio (mutually exclusive bridges) ----
   auto* alsaRadio = new QRadioButton(tr("PA Bridge → ALSA (default)"), group);
-  auto* pureRadio = new QRadioButton(tr("Pure ALSA (no bridge)"), group);
+  auto* pureRadio = new QRadioButton(tr("ALSA (no bridge)"), group);
   m_jackRadio = new QRadioButton(tr("PA Bridge → JACK"), group);
 
   // Reflect what is actually active (a bridge may already be running from login)
