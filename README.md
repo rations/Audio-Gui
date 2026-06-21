@@ -1,6 +1,6 @@
 # Audio-Gui
 
-A small, modern Qt6 desktop app for controlling Linux audio on **ALSA-only**
+A small, Qt6 desktop app for controlling Linux audio on **ALSA-only**
 systems — no PulseAudio daemon, no PipeWire. It combines the everyday
 `alsamixer` controls with a toggle for the bundled PulseAudio-compatibility
 bridges, so apps that only speak PulseAudio still get sound.
@@ -47,12 +47,19 @@ PA-protocol sockets that expose just enough for apps to believe PulseAudio is
 present. Only UNIX sockets are used (no dependency on systemd or Wayland).
 
 The `pa-alsa-bridge` implements both **playback** and **capture**: besides games and
-browsers, it answers sink-input introspection (so players like VLC that query their
-own stream stay connected) and exposes a **monitor source** (`alsa_sink.monitor`) with
-real record streams, so screen recorders and capture apps (Simple Screen Recorder,
-OBS, Audacity, voice chat) can record the mixed output. The monitor is taken
-post-mix, so it is unaffected by live output-device switching. Record streams are
-resampled/converted to whatever sample rate and format the recording app requests.
+browsers, it negotiates the **extended format API** used by players like VLC (which
+send the stream's PCM format as a format list rather than a plain sample spec) and
+answers sink-input introspection, so those players connect and play. Each playback
+stream is **resampled** from the app's own sample rate to the device rate and its
+sample format converted (16-bit, 24-bit packed, 24-in-32-bit and 32-bit integer, and
+32-bit float are all accepted), so players that don't adapt to the advertised rate or
+format (e.g. Parole playing 24-bit FLAC/WAV) still play cleanly. Per-stream **volume and mute** are honoured (the cubic
+PulseAudio mapping), so a player's own volume slider works. It also exposes a
+**monitor source** (`alsa_sink.monitor`) with real record streams, so screen
+recorders and capture apps (Simple Screen Recorder, OBS, Audacity, voice chat) can
+record the mixed output. The monitor is taken post-mix, so it is unaffected by live
+output-device switching. Record streams are likewise resampled/converted to whatever
+sample rate and format the recording app requests.
 
 On first run, if you have **no ALSA configuration at all** (neither `~/.asoundrc`
 nor `/etc/asound.conf`), Audio-Gui writes a baseline `~/.asoundrc` that sets up a
