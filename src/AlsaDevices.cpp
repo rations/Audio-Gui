@@ -80,8 +80,19 @@ QVector<OutputDevice> enumerateOutputs()
       d.category = classify(cardName, cardLong, components, pcmName, pcmId);
       // Card name is the primary label; append the PCM name when it adds detail
       // (e.g. multiple HDMI outputs on one card).
-      d.displayName =
-        pcmName.isEmpty() || pcmName == cardName ? cardName : QStringLiteral("%1 — %2").arg(cardName, pcmName);
+      // pcmName is empty for sof-hda-dsp (aplay shows "[]"); fall back to pcmId
+      // which carries meaningful strings like "HDA Analog", "HDMI1". Strip the
+      // trailing " (*)" suffix that ALSA appends to pcmId strings.
+      QString label = pcmName;
+      if (label.isEmpty()) {
+        label = pcmId;
+        const int paren = label.lastIndexOf(QLatin1String(" ("));
+        if (paren > 0)
+          label.truncate(paren);
+      }
+      d.displayName = label.isEmpty() || label == cardName
+                      ? cardName
+                      : QStringLiteral("%1 — %2").arg(cardName, label);
       out.push_back(d);
     }
 

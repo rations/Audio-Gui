@@ -315,6 +315,8 @@ QString BridgeManager::asoundrcContents(const QString& playbackSlave, const QStr
            "    pcm \"%2\"\n"
            "    rate 48000\n"
            "    channels %4\n"
+           "    period_size 512\n"
+           "    buffer_size 4096\n"
            "  }\n"
            "}\n"
            "pcm.audiogui_dsnoop {\n"

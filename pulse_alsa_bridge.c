@@ -166,7 +166,7 @@ static ring_t *ring_create(size_t sz) {
     while (p < sz) p <<= 1;
     ring_t *rb = calloc(1, sizeof(*rb));
     if (!rb) return NULL;
-    rb->buf = malloc(p);
+    rb->buf = calloc(1, p);
     if (!rb->buf) { free(rb); return NULL; }
     rb->size = p;
     rb->mask = p - 1;
@@ -179,7 +179,12 @@ static void ring_free(ring_t *rb) {
 }
 
 static void ring_reset(ring_t *rb) {
-    rb->r = rb->w = 0;
+    /* Store w first, then fence, then r. play_loop reads r before w
+     * (ring_read_space = (w - r) & mask), so writing r last ensures the
+     * consumer never sees a transiently large available-byte count. */
+    rb->w = 0;
+    __sync_synchronize();
+    rb->r = 0;
 }
 
 static int ring_mlock(ring_t *rb) {
@@ -2175,7 +2180,7 @@ static int alsa_open_handle(snd_pcm_t **out, const char *dev, unsigned want_rate
     snd_pcm_sw_params_t *sw;
     snd_pcm_sw_params_alloca(&sw);
     snd_pcm_sw_params_current(pcm, sw);
-    snd_pcm_sw_params_set_start_threshold(pcm, sw, bufsz);
+    snd_pcm_sw_params_set_start_threshold(pcm, sw, period);
     snd_pcm_sw_params_set_avail_min(pcm, sw, period);
     snd_pcm_sw_params(pcm, sw);
 
@@ -2359,9 +2364,13 @@ int main(int argc, char *argv[]) {
     if (alsa_open(dev) < 0)
         return 1;
 
-    /* Buffer sizing relative to ALSA period (kept in float units, like the
-     * JACK variant, because the PA flow-control math is expressed that way) */
-    uint32_t period_bytes = (uint32_t)g_period * 2u * (uint32_t)sizeof(float);
+    /* Buffer sizing relative to ALSA period. Cap the period used here at 1024
+     * frames so that on devices with large hw periods (e.g. sof-hda-dsp reports
+     * 4096 frames through dmix) the PA flow-control window stays sane (~93 ms
+     * tlength) rather than ballooning to 742 ms and starving the ring. */
+    uint32_t buf_period = (uint32_t)g_period;
+    if (buf_period > 1024u) buf_period = 1024u;
+    uint32_t period_bytes = buf_period * 2u * (uint32_t)sizeof(float);
     BUF_MAXLENGTH = period_bytes * 16u;
     BUF_TLENGTH   = period_bytes * 4u;
     BUF_PREBUF    = period_bytes * 2u;
