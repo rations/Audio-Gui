@@ -10,10 +10,9 @@
 # whenever it runs — at login (via the headless `--restore` autostart entry) and
 # on every device switch. Because the running app refuses to overwrite a config
 # it did not write, the *installer* is what takes ownership: it moves any existing
-# ~/.asoundrc aside to ~/.asoundrc.bak (the uninstaller restores it) and lets the
-# app write its own at next login. So after installing, log out and back in (or
-# launch Audio Control once) to have your ALSA "default" written; sound routing
-# is unchanged until then. Pass --keep-asoundrc to leave your own config in place.
+# ~/.asoundrc aside to ~/.asoundrc.bak (the uninstaller restores it), then runs
+# `audio-gui --restore` so the app writes its own config and activates routing
+# right away — no need to log out first.
 #
 # By default it uses the bundled prebuilt binaries when they resolve their
 # libraries on this system; otherwise (or with --from-source) it builds from the
@@ -48,7 +47,6 @@ OPT_BINS=(pulse-jack-bridge)
 
 DO_DEPS=1
 DO_AUTOSTART=1
-TAKEOVER_ASOUNDRC=1
 FROM_SOURCE=0
 
 # Set once the build/prebuilt source of binaries is chosen.
@@ -69,8 +67,6 @@ Options:
   --no-deps       Do not install system packages (install dependencies yourself).
   --no-autostart  Do not install the login autostart entry. Audio-Gui then only
                   generates ~/.asoundrc and applies routing when you launch it.
-  --keep-asoundrc Leave any existing ~/.asoundrc in place. Audio-Gui will not
-                  take it over (and will not manage your ALSA "default").
   --help          Show this help.
 
 Environment:
@@ -84,7 +80,6 @@ for arg in "$@"; do
     --from-source) FROM_SOURCE=1 ;;
     --no-deps) DO_DEPS=0 ;;
     --no-autostart) DO_AUTOSTART=0 ;;
-    --keep-asoundrc) TAKEOVER_ASOUNDRC=0 ;;
     -h | --help)
       usage
       exit 0
@@ -287,10 +282,10 @@ fi
 # Audio-Gui rewrites ~/.asoundrc at login and on every device switch, but the
 # running app only ever rewrites a file it wrote itself — it will not overwrite a
 # hand-rolled config. So the installer performs the one-time takeover: move the
-# user's existing ~/.asoundrc to ~/.asoundrc.bak so it survives, and let the app
-# write its correct per-card replacement at next login. The uninstaller restores
-# the backup. We do NOT write a replacement here (the generic one we used to
-# write did not match the user's card).
+# user's existing ~/.asoundrc to ~/.asoundrc.bak so it survives, then (below) run
+# `audio-gui --restore` to write the correct per-card replacement. The uninstaller
+# restores the backup. We do NOT write a replacement by hand here (the generic one
+# we used to write did not match the user's card).
 back_up_user_asoundrc()
 {
   # Nothing to do if there is no file, or it is already one we manage.
@@ -307,16 +302,11 @@ back_up_user_asoundrc()
   else
     mv -- "$ASOUNDRC" "$backup"
   fi
-  info "backed up your existing ~/.asoundrc to $backup"
-  info "Audio-Gui writes its own at next login; the uninstaller restores yours."
+  info "backed up your existing ~/.asoundrc to $backup (the uninstaller restores it)"
 }
 
-if [ "$TAKEOVER_ASOUNDRC" -eq 1 ]; then
-  step "Backing up any existing ~/.asoundrc"
-  back_up_user_asoundrc
-else
-  step "Leaving existing ~/.asoundrc in place (--keep-asoundrc)"
-fi
+step "Backing up any existing ~/.asoundrc"
+back_up_user_asoundrc
 
 # ---- 5. login autostart entry (this is what writes ~/.asoundrc) -------------
 
@@ -351,6 +341,22 @@ else
   step "Skipping login autostart entry (--no-autostart)"
 fi
 
+# ---- 6. activate routing now ------------------------------------------------
+
+# Run the same headless path the autostart entry uses at login, so Audio-Gui
+# writes its per-card ~/.asoundrc and brings up the default routing immediately —
+# the user does not have to log out or open the GUI first. Best-effort: this can
+# fail in a session with no audio access (e.g. plain SSH), in which case the
+# autostart entry handles it at the next login.
+ASOUNDRC_WRITTEN=0
+step "Activating audio routing"
+if "$BINDIR/audio-gui" --restore >/dev/null 2>&1; then
+  ASOUNDRC_WRITTEN=1
+  info "wrote ~/.asoundrc and started the default routing"
+else
+  warn "could not activate routing now; it will start at your next login."
+fi
+
 # ---- summary ----------------------------------------------------------------
 
 step "Done"
@@ -364,15 +370,12 @@ case ":$PATH:" in
     info "      echo 'export PATH=\"$BINDIR:\$PATH\"' >> ~/.profile"
     ;;
 esac
-if [ "$TAKEOVER_ASOUNDRC" -eq 1 ] && [ -e "$ASOUNDRC.bak" ]; then
+if [ -e "$ASOUNDRC.bak" ]; then
   info "Saved config: $ASOUNDRC.bak (restored by uninstall.sh)"
 fi
 info "Launch 'audio-gui' or pick \"Audio Control\" from your menu."
-if [ "$DO_AUTOSTART" -eq 1 ]; then
+if [ "$ASOUNDRC_WRITTEN" -eq 0 ]; then
   printf '\n'
-  warn "Log out and log back in to finish setup."
-  info "At login Audio-Gui writes your ~/.asoundrc and activates audio routing."
-  info "Until you do (or launch Audio Control once), your sound is unchanged."
-else
-  info "Launch Audio Control once to write ~/.asoundrc and activate audio routing."
+  warn "Audio routing is not active yet."
+  info "Log out and back in (or launch Audio Control once) to start it."
 fi
