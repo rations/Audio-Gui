@@ -119,7 +119,10 @@ MainWindow::MainWindow(QWidget* parent)
 
   connect(&m_mixer, &AlsaMixer::changed, this, &MainWindow::onMixerChanged);
   connect(&m_bridges, &BridgeManager::jackAvailabilityChanged, this, &MainWindow::onJackAvailabilityChanged);
-  connect(&m_bridges, &BridgeManager::modeChanged, this, [this](BridgeManager::Mode) { updateDeviceComboEnabled(); });
+  connect(&m_bridges, &BridgeManager::modeChanged, this, [this](BridgeManager::Mode) {
+    updateDeviceComboEnabled();
+    updateMeterVisibility();
+  });
 
   // Re-scan cards periodically so USB/HDMI plug/unplug updates the list live —
   // no udev, no daemon, all in-process.
@@ -133,6 +136,7 @@ MainWindow::MainWindow(QWidget* parent)
   ensureAutostartEntry();
   onJackAvailabilityChanged(m_bridges.jackAvailable());
   updateDeviceComboEnabled();
+  updateMeterVisibility();
 }
 
 QWidget* MainWindow::buildMixerSection()
@@ -151,8 +155,9 @@ QWidget* MainWindow::buildMixerSection()
   m_stripsLayout->addWidget(m_mixerPlaceholder);
 
   m_meter = new LevelMeter(group);
+  m_meterLabel = new QLabel(tr("Output level"), group);
   col->addSpacing(6);
-  col->addWidget(new QLabel(tr("Output level"), group));
+  col->addWidget(m_meterLabel);
   col->addWidget(m_meter);
 
   return group;
@@ -469,4 +474,15 @@ void MainWindow::updateDeviceComboEnabled()
       m_deviceCombo->setToolTip(tr("Device selection does not apply when routing to JACK"));
       break;
   }
+}
+
+void MainWindow::updateMeterVisibility()
+{
+  // Only the pulse bridges publish peak data into the shared page the meter
+  // reads; pure ALSA has no writer, so hide the meter rather than show a dead one.
+  const bool bridged = m_bridges.currentMode() != BridgeManager::Mode::PureAlsa;
+  if (m_meter)
+    m_meter->setVisible(bridged);
+  if (m_meterLabel)
+    m_meterLabel->setVisible(bridged);
 }

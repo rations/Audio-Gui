@@ -53,6 +53,10 @@ private:
   // repopulate the controls. Empty id / Internal -> ALSA "default".
   void reopenMixerForDevice(const QString& cardId);
   void updateDeviceComboEnabled();
+  // Show the output-level meter only when a pulse bridge is running (PA→ALSA or
+  // PA→JACK): in pure-ALSA mode nothing publishes peak data, so the meter would
+  // sit dead — hide it (and its label) instead.
+  void updateMeterVisibility();
 
   AlsaMixer m_mixer;
   BridgeManager m_bridges;
@@ -69,6 +73,7 @@ private:
 
   QRadioButton* m_jackRadio = nullptr;
   LevelMeter* m_meter = nullptr;
+  QLabel* m_meterLabel = nullptr; // "Output level" caption, hidden with the meter
 
   // Device selection + the card-specific control containers it rebuilds.
   QComboBox* m_deviceCombo = nullptr;
