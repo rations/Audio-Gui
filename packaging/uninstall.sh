@@ -108,14 +108,15 @@ fi
 # ---- ALSA config ------------------------------------------------------------
 
 step "Restoring ALSA config"
-if [ -f "$ASOUNDRC" ] && grep -q "$ASOUND_MARKER" "$ASOUNDRC"; then
-  if [ -e "$ASOUND_BACKUP" ]; then
-    mv -f -- "$ASOUND_BACKUP" "$ASOUNDRC"
-    info "restored previous ~/.asoundrc from backup"
-  else
-    rm -f -- "$ASOUNDRC"
-    info "removed Audio-Gui ~/.asoundrc (ALSA falls back to its built-in default)"
-  fi
+if [ -e "$ASOUND_BACKUP" ]; then
+  # install.sh moved the user's original here when Audio-Gui took over. Put it
+  # back, replacing whatever Audio-Gui wrote (or restoring it if the app never
+  # wrote one because they uninstalled before logging back in).
+  mv -f -- "$ASOUND_BACKUP" "$ASOUNDRC"
+  info "restored your original ~/.asoundrc from $ASOUND_BACKUP"
+elif [ -f "$ASOUNDRC" ] && grep -q "$ASOUND_MARKER" "$ASOUNDRC"; then
+  rm -f -- "$ASOUNDRC"
+  info "removed Audio-Gui ~/.asoundrc (no backup; ALSA falls back to its built-in default)"
 else
   info "~/.asoundrc is not Audio-Gui-managed; left untouched"
 fi

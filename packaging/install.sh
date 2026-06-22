@@ -3,15 +3,24 @@
 # Audio-Gui installer (per-user, no root).
 #
 # Installs Audio-Gui into a per-user prefix, registers a desktop menu entry,
-# installs a generic ~/.asoundrc (backing up any existing one), and installs the
+# installs a login autostart entry (audio-gui --restore), and installs the
 # packages Audio-Gui needs via the system package manager.
+#
+# Audio-Gui manages ~/.asoundrc: it (re)writes a correct, per-card ALSA "default"
+# whenever it runs — at login (via the headless `--restore` autostart entry) and
+# on every device switch. Because the running app refuses to overwrite a config
+# it did not write, the *installer* is what takes ownership: it moves any existing
+# ~/.asoundrc aside to ~/.asoundrc.bak (the uninstaller restores it) and lets the
+# app write its own at next login. So after installing, log out and back in (or
+# launch Audio Control once) to have your ALSA "default" written; sound routing
+# is unchanged until then. Pass --keep-asoundrc to leave your own config in place.
 #
 # By default it uses the bundled prebuilt binaries when they resolve their
 # libraries on this system; otherwise (or with --from-source) it builds from the
 # bundled source tree. Only dependency installation is privileged (uses sudo);
 # every file this script writes lands under $PREFIX (default ~/.local) and ~/.
 #
-# Usage: ./install.sh [--from-source] [--no-deps] [--no-asoundrc] [--help]
+# Usage: ./install.sh [--from-source] [--no-deps] [--no-autostart] [--help]
 #   PREFIX=/usr/local ./install.sh   # system-wide install (needs write access)
 
 set -euo pipefail
@@ -26,13 +35,20 @@ APPDIR="$PREFIX/share/applications"
 ASOUNDRC="$HOME/.asoundrc"
 ASOUND_MARKER="Written by Audio-Gui"
 
+# Login autostart entry that runs `audio-gui --restore` headless to bring up the
+# saved routing (and write ~/.asoundrc) without opening the GUI. Mirrors what the
+# GUI installs on first launch, so the app treats it as already up to date.
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+AUTOSTART_FILE="$AUTOSTART_DIR/audio-gui-restore.desktop"
+
 # The bridge binaries the GUI launches from alongside itself; pulse-jack-bridge
 # is optional (only present when libjack was available at build time).
 BINS=(audio-gui pa-alsa-bridge)
 OPT_BINS=(pulse-jack-bridge)
 
 DO_DEPS=1
-DO_ASOUNDRC=1
+DO_AUTOSTART=1
+TAKEOVER_ASOUNDRC=1
 FROM_SOURCE=0
 
 # Set once the build/prebuilt source of binaries is chosen.
@@ -51,7 +67,10 @@ Options:
                   binaries (also done automatically if the prebuilt ones cannot
                   run on this system).
   --no-deps       Do not install system packages (install dependencies yourself).
-  --no-asoundrc   Do not write a generic ~/.asoundrc.
+  --no-autostart  Do not install the login autostart entry. Audio-Gui then only
+                  generates ~/.asoundrc and applies routing when you launch it.
+  --keep-asoundrc Leave any existing ~/.asoundrc in place. Audio-Gui will not
+                  take it over (and will not manage your ALSA "default").
   --help          Show this help.
 
 Environment:
@@ -64,7 +83,8 @@ for arg in "$@"; do
   case "$arg" in
     --from-source) FROM_SOURCE=1 ;;
     --no-deps) DO_DEPS=0 ;;
-    --no-asoundrc) DO_ASOUNDRC=0 ;;
+    --no-autostart) DO_AUTOSTART=0 ;;
+    --keep-asoundrc) TAKEOVER_ASOUNDRC=0 ;;
     -h | --help)
       usage
       exit 0
@@ -90,8 +110,7 @@ cleanup() { [ -n "$BUILD_TMP" ] && rm -rf -- "$BUILD_TMP"; }
 trap cleanup EXIT
 
 # Refuse to run as root for the default per-user prefix: it would install into
-# root's home and write root's ~/.asoundrc. A system PREFIX may legitimately run
-# as root.
+# root's home and root's autostart. A system PREFIX may legitimately run as root.
 if [ "$(id -u)" -eq 0 ] && [ "$PREFIX" = "$HOME/.local" ]; then
   die "do not run as root for a per-user install. Run as your normal user, or set PREFIX=/usr/local."
 fi
@@ -263,63 +282,73 @@ if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$APPDIR" >/dev/null 2>&1 || true
 fi
 
-# ---- 4. generic ~/.asoundrc -------------------------------------------------
+# ---- 4. take ownership of ~/.asoundrc (backing up the user's own) -----------
 
-is_audiogui_asoundrc()
+# Audio-Gui rewrites ~/.asoundrc at login and on every device switch, but the
+# running app only ever rewrites a file it wrote itself — it will not overwrite a
+# hand-rolled config. So the installer performs the one-time takeover: move the
+# user's existing ~/.asoundrc to ~/.asoundrc.bak so it survives, and let the app
+# write its correct per-card replacement at next login. The uninstaller restores
+# the backup. We do NOT write a replacement here (the generic one we used to
+# write did not match the user's card).
+back_up_user_asoundrc()
 {
-  [ -f "$ASOUNDRC" ] && grep -q "$ASOUND_MARKER" "$ASOUNDRC"
-}
+  # Nothing to do if there is no file, or it is already one we manage.
+  [ -e "$ASOUNDRC" ] || return 0
+  grep -q "$ASOUND_MARKER" "$ASOUNDRC" 2>/dev/null && return 0
 
-write_generic_asoundrc()
-{
-  cat >"$ASOUNDRC" <<'EOF'
-# Written by Audio-Gui: software-mixing default output.
-# Generic baseline installed by install.sh — Audio-Gui refines this per card.
-# Delete this file to fall back to ALSA's built-in default.
-pcm.!default {
-  type plug
-  slave.pcm "audiogui_asym"
-}
-ctl.!default {
-  type hw
-  card 0
-}
-pcm.audiogui_asym {
-  type asym
-  playback.pcm "audiogui_dmix"
-  capture.pcm "audiogui_dsnoop"
-}
-pcm.audiogui_dmix {
-  type dmix
-  ipc_key 1024
-  slave {
-    pcm "hw:0,0"
-    rate 48000
-  }
-}
-pcm.audiogui_dsnoop {
-  type dsnoop
-  ipc_key 1025
-  slave.pcm "hw:0,0"
-}
-EOF
-}
-
-if [ "$DO_ASOUNDRC" -eq 1 ]; then
-  step "Installing generic ~/.asoundrc"
-  if [ -e "$ASOUNDRC" ] && ! is_audiogui_asoundrc; then
-    # Back up a hand-rolled config; never clobber an earlier backup.
-    backup="$ASOUNDRC.bak"
-    if [ -e "$backup" ]; then
-      backup="$ASOUNDRC.bak.$(date +%Y%m%d%H%M%S)"
-    fi
+  # Never clobber an earlier ~/.asoundrc.bak — it holds the *real* original from a
+  # previous install. Keep any later config as a timestamped copy instead.
+  local backup="$ASOUNDRC.bak"
+  if [ -e "$backup" ]; then
+    backup="$ASOUNDRC.bak.$(date +%Y%m%d%H%M%S)"
     cp -p -- "$ASOUNDRC" "$backup"
-    info "backed up existing ~/.asoundrc to $backup"
+    rm -f -- "$ASOUNDRC"
+  else
+    mv -- "$ASOUNDRC" "$backup"
   fi
-  write_generic_asoundrc
-  info "wrote generic ~/.asoundrc"
+  info "backed up your existing ~/.asoundrc to $backup"
+  info "Audio-Gui writes its own at next login; the uninstaller restores yours."
+}
+
+if [ "$TAKEOVER_ASOUNDRC" -eq 1 ]; then
+  step "Backing up any existing ~/.asoundrc"
+  back_up_user_asoundrc
 else
-  step "Skipping ~/.asoundrc (--no-asoundrc)"
+  step "Leaving existing ~/.asoundrc in place (--keep-asoundrc)"
+fi
+
+# ---- 5. login autostart entry (this is what writes ~/.asoundrc) -------------
+
+# We deliberately do NOT write ~/.asoundrc here. Audio-Gui writes a correct,
+# per-card ~/.asoundrc itself (and never clobbers a hand-rolled one) the first
+# time it runs — including the headless `audio-gui --restore` this entry runs at
+# login. Installing the entry now means a log out / log back in is enough to get
+# your ALSA "default"; the user never has to open the GUI.
+write_autostart_entry()
+{
+  mkdir -p -- "$AUTOSTART_DIR"
+  # Keep this byte-for-byte identical to ensureAutostartEntry() in MainWindow.cpp
+  # so the GUI sees it as up to date and does not rewrite it on first launch.
+  cat >"$AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Audio routing (restore)
+Comment=Restore the saved PulseAudio-compat audio routing
+Exec="$BINDIR/audio-gui" --restore
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+  chmod 0644 -- "$AUTOSTART_FILE"
+}
+
+if [ "$DO_AUTOSTART" -eq 1 ]; then
+  step "Installing login autostart entry to $AUTOSTART_DIR"
+  write_autostart_entry
+  info "installed audio-gui-restore.desktop"
+else
+  step "Skipping login autostart entry (--no-autostart)"
 fi
 
 # ---- summary ----------------------------------------------------------------
@@ -327,7 +356,7 @@ fi
 step "Done"
 info "Binaries:     $BINDIR"
 info "Menu entry:   $APPDIR/audio-gui.desktop"
-[ "$DO_ASOUNDRC" -eq 1 ] && info "ALSA config:  $ASOUNDRC"
+[ "$DO_AUTOSTART" -eq 1 ] && info "Autostart:    $AUTOSTART_FILE"
 case ":$PATH:" in
   *":$BINDIR:"*) ;;
   *)
@@ -335,5 +364,15 @@ case ":$PATH:" in
     info "      echo 'export PATH=\"$BINDIR:\$PATH\"' >> ~/.profile"
     ;;
 esac
+if [ "$TAKEOVER_ASOUNDRC" -eq 1 ] && [ -e "$ASOUNDRC.bak" ]; then
+  info "Saved config: $ASOUNDRC.bak (restored by uninstall.sh)"
+fi
 info "Launch 'audio-gui' or pick \"Audio Control\" from your menu."
-info "On first launch it adds a login autostart entry so audio works after reboot."
+if [ "$DO_AUTOSTART" -eq 1 ]; then
+  printf '\n'
+  warn "Log out and log back in to finish setup."
+  info "At login Audio-Gui writes your ~/.asoundrc and activates audio routing."
+  info "Until you do (or launch Audio Control once), your sound is unchanged."
+else
+  info "Launch Audio Control once to write ~/.asoundrc and activate audio routing."
+fi
