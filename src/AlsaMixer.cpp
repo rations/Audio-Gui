@@ -38,13 +38,25 @@ AlsaMixer::AlsaMixer(QObject* parent)
 
 AlsaMixer::~AlsaMixer()
 {
+  close();
+}
+
+void AlsaMixer::close()
+{
   qDeleteAll(m_notifiers);
   m_notifiers.clear();
+  m_elements.clear();
   if (m_handle)
   {
     snd_mixer_close(m_handle);
     m_handle = nullptr;
   }
+}
+
+bool AlsaMixer::reopen(const QString& card)
+{
+  close();
+  return open(card);
 }
 
 bool AlsaMixer::open(const QString& card)

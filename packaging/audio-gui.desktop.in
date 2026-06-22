@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Audio Control
+GenericName=Audio Controls
+Comment=Control ALSA audio and PulseAudio-compat routing
+Exec=@EXEC@
+Icon=multimedia-volume-control
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;Settings;
+Keywords=audio;sound;volume;mixer;alsa;pulseaudio;
