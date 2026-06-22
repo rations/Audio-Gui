@@ -373,6 +373,8 @@ typedef struct {
     uint32_t  payload_len;   /* expected byte count */
     uint32_t  payload_pos;   /* received so far */
     uint32_t  channel;       /* parsed from header */
+    int64_t   seek_offset;   /* parsed from header: signed byte offset for this packet */
+    uint8_t   seek_mode;     /* parsed from header: pa_seek_mode_t (flags & 0xFF) */
 } Client;
 
 static Client clients[MAX_CLIENTS];
@@ -1054,13 +1056,75 @@ static void play_feed(PaStream *s, int slot, const float *inL, const float *inR,
  * Audio data handler (called when channel != PA_CONTROL_CHANNEL)
  * ====================================================================== */
 
-static void handle_audio(uint32_t channel, const uint8_t *data, uint32_t len) {
+/* Client-byte read index = write_index minus what is still buffered in the ring.
+ * The ring holds device-rate (g_rate) float frames, so scale back to the client's
+ * rate and format. Shared by handle_audio (seek reconciliation) and
+ * cmd_get_playback_latency (timing reply). */
+static uint64_t stream_read_index(const PaStream *s, uint32_t channel) {
+    uint32_t bps = fmt_bytes(s->format);
+    size_t rb_floats = ring_read_space(rb_L[channel]) / sizeof(float);
+    uint64_t client_frames = (g_rate != 0)
+        ? (uint64_t)rb_floats * s->rate / g_rate
+        : (uint64_t)rb_floats;
+    uint64_t unread = client_frames * bps * (uint32_t)s->channels;
+    return (s->write_index > unread) ? s->write_index - unread : 0;
+}
+
+static void handle_audio(uint32_t channel, const uint8_t *data, uint32_t len,
+                         int64_t seek_offset, uint8_t seek_mode) {
     if (channel >= MAX_STREAMS || !streams[channel].active) return;
     PaStream *s = &streams[channel];
 
     uint32_t bps         = fmt_bytes(s->format);
     uint32_t frame_bytes = bps * s->channels;
     if (frame_bytes == 0) return;
+
+    /* ---- Timeline seek reconciliation ----------------------------------------
+     * A media player seeking the timeline repositions its write index via the
+     * packet's seek mode + offset and debits its write-credit accordingly. We must
+     * mirror that here so our write_index stays in lockstep with the client (else
+     * REQUEST credit desyncs and the client stops writing → stall). Resolve the
+     * absolute client-byte position this packet targets; if it is not the current
+     * queue end, it is a real seek. */
+    uint64_t queue_end = s->write_index;
+    int64_t  target;
+    switch (seek_mode) {
+    case 1:  /* PA_SEEK_ABSOLUTE: absolute byte index */
+        target = seek_offset; break;
+    case 2:  /* PA_SEEK_RELATIVE_ON_READ: relative to read index */
+    case 3:  /* PA_SEEK_RELATIVE_END: we have no queue end distinct from read+buffered,
+              *  so anchor on read index (rare from VLC/Parole; safe either way) */
+        target = (int64_t)stream_read_index(s, channel) + seek_offset; break;
+    case 0:  /* PA_SEEK_RELATIVE: relative to queue end (offset 0 = normal append) */
+    default:
+        target = (int64_t)queue_end + seek_offset; break;
+    }
+    if (target < 0) target = 0;
+
+    int repositioned = ((uint64_t)target != queue_end);
+    if (repositioned) {
+        /* The ring is strictly SPSC; we cannot rewind over data the playback thread
+         * may already have consumed. The only safe reposition is to discard the
+         * buffered-but-unplayed audio and re-anchor write_index to the seek target —
+         * exactly what FLUSH does. Forward gaps are dropped (no silence fill): the
+         * player's clock is driven by write_index, which we set exactly. */
+        if (g_debug)
+            fprintf(stderr,
+                "pulse-alsa-bridge: stream %u: SEEK mode=%u off=%lld queue_end=%llu "
+                "read_idx=%llu → reanchor write_index=%llu\n",
+                channel, seek_mode, (long long)seek_offset,
+                (unsigned long long)queue_end,
+                (unsigned long long)stream_read_index(s, channel),
+                (unsigned long long)target);
+        ring_reset(rb_L[channel]);
+        ring_reset(rb_R[channel]);
+        s->rs_phase = 0.0;
+        s->rs_prevL = 0.0f;
+        s->rs_prevR = 0.0f;
+        s->write_index = (uint64_t)target;
+        s->started     = 0;   /* re-arm STARTED for the new position */
+    }
+    /* ------------------------------------------------------------------------- */
 
     uint32_t nframes = len / frame_bytes;
     if (nframes > CONV_FRAMES) nframes = CONV_FRAMES;
@@ -1094,12 +1158,15 @@ static void handle_audio(uint32_t channel, const uint8_t *data, uint32_t len) {
         send_cmd(s->client_fd, &ev);
     }
 
-    /* Request more audio only when the ring is below the target fill level.
-     * ring_target: 2 BUF_TLENGTH chunks in ring-float-bytes per channel (~42 ms). */
+    /* Request more audio when the ring is below the target fill level, OR
+     * unconditionally right after a reposition. ring_target: 2 BUF_TLENGTH chunks
+     * in ring-float-bytes per channel (~42 ms). The post-seek grant is the anti-stall
+     * step: it pulls the client's (possibly negative) requested_bytes back above 0 so
+     * its write callback fires again from the new anchor. */
     uint32_t bps_req = (s->format == PA_SAMPLE_S16LE) ? 2u : 4u;
     uint32_t ring_chunk = BUF_TLENGTH / (bps_req * (uint32_t)s->channels) * (uint32_t)sizeof(float);
     if (s->client_fd != -1 && !s->corked &&
-        ring_read_space(rb_L[channel]) < ring_chunk * 2u)
+        (repositioned || ring_read_space(rb_L[channel]) < ring_chunk * 2u))
         send_request(s->client_fd, channel, BUF_TLENGTH);
 }
 
@@ -1169,15 +1236,7 @@ static void cmd_get_playback_latency(Client *cl, TsR *ts, uint32_t tag) {
     if (idx < MAX_STREAMS && streams[idx].active) {
         PaStream *s = &streams[idx];
         write_idx = s->write_index;
-        /* Bytes still buffered in ring, expressed in client bytes. The ring holds
-         * device-rate (g_rate) float frames, so scale back to the client's rate. */
-        uint32_t bps = fmt_bytes(s->format);
-        size_t rb_floats = ring_read_space(rb_L[idx]) / sizeof(float);
-        uint64_t client_frames = (g_rate != 0)
-            ? (uint64_t)rb_floats * s->rate / g_rate
-            : (uint64_t)rb_floats;
-        uint64_t unread  = client_frames * bps * s->channels;
-        read_idx = (write_idx > unread) ? write_idx - unread : 0;
+        read_idx  = stream_read_index(s, idx);
     }
 
     TsW rep = {0};
@@ -1601,7 +1660,7 @@ static void cmd_get_record_latency(Client *cl, TsR *ts, uint32_t tag) {
 static void dispatch(Client *cl, uint32_t channel,
                      const uint8_t *data, uint32_t len) {
     if (channel != PA_CONTROL_CHANNEL) {
-        handle_audio(channel, data, len);
+        handle_audio(channel, data, len, cl->seek_offset, cl->seek_mode);
         return;
     }
 
@@ -1743,15 +1802,19 @@ static void dispatch(Client *cl, uint32_t channel,
             ring_reset(rb_L[idx]);
             ring_reset(rb_R[idx]);
         }
-        uint64_t widx = (idx < MAX_STREAMS && streams[idx].active)
-                        ? streams[idx].write_index : 0u;
-        TsW rep = {0};
-        tw_u32(&rep, PA_CMD_REPLY);
-        tw_u32(&rep, tag);
-        tw_u64(&rep, 'r', widx);   /* write_index (PA_TAG_S64) */
-        tw_u64(&rep, 'r', widx);   /* read_index = write_index: buffer flushed */
-        send_cmd(cl->fd, &rep);
-        if (idx < MAX_STREAMS && streams[idx].active && !streams[idx].corked)
+        /* FLUSH replies with a PLAIN ack — NOT write_index/read_index. libpulse's
+         * pa_stream_flush registers pa_stream_simple_ack_callback, which fails the
+         * whole context with PA_ERR_PROTOCOL if the reply tagstruct is not empty
+         * (stream.c:2292), disconnecting the client. Verified: real PA sends only
+         * pa_pstream_send_simple_ack (protocol-native.c:4016). Players flush on every
+         * timeline seek, so a malformed reply here froze playback on seek. */
+        send_reply_empty(cl->fd, tag);
+        /* Re-grant credit so the client resumes writing from the new position after
+         * the flush (REQUEST is a separate server→client command, not part of the
+         * ack, so it does not corrupt the reply). Skip while corked — uncork sends
+         * its own REQUEST. */
+        if (idx < MAX_STREAMS && streams[idx].active && !streams[idx].corked &&
+            streams[idx].client_fd != -1)
             send_request(cl->fd, idx, BUF_TLENGTH);
         break;
     }
@@ -1892,6 +1955,11 @@ static int read_client(Client *cl) {
             memcpy(h, cl->hdr, HDR_LEN);
             cl->payload_len = ntohl(h[0]);
             cl->channel     = ntohl(h[1]);
+            /* h[2]/h[3] = 64-bit signed seek offset, h[4] low 8 bits = seek mode.
+             * Audio (non-control) packets carry these for timeline seeks; control
+             * packets always send offset 0 / SEEK_RELATIVE, so this is harmless there. */
+            cl->seek_offset = (int64_t)(((uint64_t)ntohl(h[2]) << 32) | ntohl(h[3]));
+            cl->seek_mode   = (uint8_t)(ntohl(h[4]) & 0xFFu);
             cl->payload_pos = 0;
 
             /* Grow payload buffer if needed */
