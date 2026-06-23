@@ -381,11 +381,14 @@ void MainWindow::reopenMixerForDevice(const QString& token)
   const QString cardId = AlsaDevices::cardIdFromToken(token);
   const QString card = cardId.isEmpty() ? QStringLiteral("default") : QStringLiteral("hw:CARD=%1").arg(cardId);
 
-  // USB interfaces expose only nominal capture controls (gain is set by hardware
-  // knobs), so their sliders do nothing useful — show the placeholder like HDMI.
+  // USB and HDMI outputs have no useful software mixer controls: USB gain is set
+  // by hardware knobs; HDMI is a digital path with no per-channel volume stage.
+  // On sof-hda-dsp, HDMI shares a card with internal speakers, so without this
+  // suppression the internal-speaker controls would appear for the HDMI selection.
   const QVector<AlsaDevices::OutputDevice> devices = AlsaDevices::enumerateOutputs();
   const AlsaDevices::OutputDevice* d = AlsaDevices::findByToken(devices, token);
-  const bool suppressControls = d && d->category == AlsaDevices::Category::Usb;
+  const bool suppressControls = d && (d->category == AlsaDevices::Category::Usb
+                                   || d->category == AlsaDevices::Category::Hdmi);
 
   m_mixer.reopen(card); // on failure the element list is empty -> placeholder shows
   populateMixerControls(suppressControls);
