@@ -235,6 +235,7 @@ static snd_pcm_uframes_t g_period;   /* negotiated period size (frames) */
 static snd_pcm_uframes_t g_bufsz;    /* negotiated buffer size (frames) */
 static pthread_t         g_play_thread;
 static int               g_thread_started;
+static char              g_current_dev[512]; /* ALSA device currently open */
 
 /* ======================================================================
  * Output peak meter (published to the GUI via POSIX shared memory)
@@ -2184,6 +2185,14 @@ static void *play_loop(void *arg) {
                 rec_feed(&rstreams[i], outL, outR, N);
         }
 
+        /* g_pcm is NULL only during a failed device switch on sof-hda-dsp while
+         * we wait for the next SIGUSR1 to retry.  Sleep one period and spin. */
+        if (!g_pcm) {
+            struct timespec ts = {0, 10000000L};
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
         snd_pcm_sframes_t w = snd_pcm_writei(g_pcm, inter, N);
         if (w < 0) {
             w = snd_pcm_recover(g_pcm, (int)w, 1);   /* EPIPE (xrun) / ESTRPIPE */
@@ -2285,25 +2294,71 @@ static int alsa_open(const char *dev) {
 
 /* Live device switch (playback thread only). Reopens at the established g_rate so
  * client streams — negotiated at g_rate — stay valid; plughw/plug converts to the
- * device's native rate. On failure the current device is kept (audio continues). */
+ * device's native rate. On failure the current device is kept (audio continues).
+ *
+ * sof-hda-dsp note: snd_pcm_open on a dmix "default" device is blocking and can
+ * stall the playback thread for 100-300 ms while the SOF firmware restarts its
+ * pipeline. Skipping when the device string is unchanged avoids the restart
+ * entirely (e.g. switching between two sof-hda-dsp sub-devices that both map to
+ * "default"). After a real switch, ring buffers are reset so the stale fill
+ * accumulated during the stall is discarded rather than rapidly drained into the
+ * fresh empty ALSA buffer; the main thread's proactive REQUEST will prompt clients
+ * to resend audio within one poll interval (~10 ms). */
 static void alsa_reopen(const char *dev) {
+    if (strcmp(dev, g_current_dev) == 0) {
+        fprintf(stderr, "pulse-alsa-bridge: device unchanged ('%s'), skip reopen\n", dev);
+        return;
+    }
+
+    /* On sof-hda-dsp the SOF firmware blocks concurrent opens on the same card:
+     * HDMI (DEV=3) and the dmix slave (DEV=0) share card resources.  Close the
+     * current device first so the new open can succeed. */
+    char old_dev[512];
+    strncpy(old_dev, g_current_dev, sizeof(old_dev) - 1);
+    old_dev[sizeof(old_dev) - 1] = '\0';
+
+    snd_pcm_drop(g_pcm);
+    snd_pcm_close(g_pcm);
+    g_pcm = NULL;   /* play_loop guards against NULL until we reassign below */
+
     snd_pcm_t        *pcm = NULL;
     unsigned          rate = 0;
     snd_pcm_uframes_t period = 0, bufsz = 0;
     if (alsa_open_handle(&pcm, dev, g_rate, &rate, &period, &bufsz) < 0) {
-        fprintf(stderr, "pulse-alsa-bridge: live switch to '%s' failed; keeping current device\n", dev);
+        fprintf(stderr, "pulse-alsa-bridge: live switch to '%s' failed; trying to reopen '%s'\n",
+                dev, old_dev);
+        /* Try to restore the previous device so audio is not permanently lost. */
+        if (alsa_open_handle(&pcm, old_dev, g_rate, &rate, &period, &bufsz) == 0) {
+            g_pcm    = pcm;
+            g_period = period;
+            g_bufsz  = bufsz;
+            fprintf(stderr, "pulse-alsa-bridge: restored '%s'\n", old_dev);
+        } else {
+            fprintf(stderr, "pulse-alsa-bridge: restore of '%s' also failed; audio suspended\n", old_dev);
+            /* g_pcm remains NULL; play_loop will sleep and retry on next SIGUSR1 */
+        }
         return;
     }
+
     if (rate != g_rate)
         fprintf(stderr, "pulse-alsa-bridge: warning: '%s' gave %u Hz (wanted %u); pitch may be off\n",
                 dev, rate, g_rate);
 
-    snd_pcm_t *old = g_pcm;
-    g_pcm    = pcm;        /* the playback thread is the only g_pcm user: safe swap */
+    g_pcm    = pcm;
     g_period = period;
     g_bufsz  = bufsz;
-    snd_pcm_drop(old);
-    snd_pcm_close(old);
+
+    /* Discard audio buffered for the old device. play_loop will write silence
+     * until the main thread's proactive REQUEST prompts clients to resend. */
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        ring_reset(rb_L[i]);
+        ring_reset(rb_R[i]);
+    }
+    for (int i = 0; i < MAX_RECORD_STREAMS; i++)
+        ring_reset(rstreams[i].rb);
+
+    strncpy(g_current_dev, dev, sizeof(g_current_dev) - 1);
+    g_current_dev[sizeof(g_current_dev) - 1] = '\0';
     fprintf(stderr, "pulse-alsa-bridge: switched output to '%s' (%u Hz)\n", dev, g_rate);
 }
 
@@ -2431,6 +2486,8 @@ int main(int argc, char *argv[]) {
     if (!dev || !*dev) dev = "default";
     if (alsa_open(dev) < 0)
         return 1;
+    strncpy(g_current_dev, dev, sizeof(g_current_dev) - 1);
+    g_current_dev[sizeof(g_current_dev) - 1] = '\0';
 
     /* Buffer sizing relative to ALSA period. Cap the period used here at 1024
      * frames so that on devices with large hw periods (e.g. sof-hda-dsp reports
