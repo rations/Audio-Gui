@@ -16,10 +16,21 @@ PREFIX="${PREFIX:-$HOME/.local}"
 BINDIR="$PREFIX/bin"
 APPDIR="$PREFIX/share/applications"
 
+# Mirror install.sh: a system install (PREFIX outside $HOME) put its autostart
+# entry in the XDG system dir, not the user's home.
+case "$PREFIX/" in
+  "$HOME"/*) SYSTEM_INSTALL=0 ;;
+  *) SYSTEM_INSTALL=1 ;;
+esac
+
 ASOUNDRC="$HOME/.asoundrc"
 ASOUND_BACKUP="$HOME/.asoundrc.bak"
 ASOUND_MARKER="Written by Audio-Gui"
-AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/audio-gui-restore.desktop"
+if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+  AUTOSTART="/etc/xdg/autostart/audio-gui-restore.desktop"
+else
+  AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/audio-gui-restore.desktop"
+fi
 SETTINGS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/AudioGui"
 
 BINS=(audio-gui pa-alsa-bridge pulse-jack-bridge)
@@ -62,7 +73,16 @@ done
 info() { printf '  %s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
 
-if [ "$(id -u)" -eq 0 ] && [ "$PREFIX" = "$HOME/.local" ]; then
+if [ "$SYSTEM_INSTALL" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    echo "  system-wide uninstall needs root — re-running under sudo (you may be prompted for your password)." >&2
+    _self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+    exec sudo PREFIX="$PREFIX" "$_self" "$@"
+  fi
+  echo "ERROR: system-wide uninstall needs root and sudo was not found. Re-run as root: PREFIX=$PREFIX $0" >&2
+  exit 1
+fi
+if [ "$SYSTEM_INSTALL" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
   echo "ERROR: do not run as root for a per-user uninstall." >&2
   exit 1
 fi

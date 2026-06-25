@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 #
-# Audio-Gui installer (per-user, no root).
+# Audio-Gui installer (system-wide or per-user).
 #
-# Installs Audio-Gui into a per-user prefix, registers a desktop menu entry,
+# Installs Audio-Gui into the chosen prefix, registers a desktop menu entry,
 # installs a login autostart entry (audio-gui --restore), and installs the
 # packages Audio-Gui needs via the system package manager.
+#
+# Install mode is chosen interactively (system-wide /usr/local — the default —
+# or per-user ~/.local), unless PREFIX is given in the environment. A system
+# install serves every user: its autostart entry goes in /etc/xdg/autostart so
+# the generic live user on a snapshot ISO gets audio routing at login too.
 #
 # Audio-Gui manages ~/.asoundrc: it (re)writes a correct, per-card ALSA "default"
 # whenever it runs — at login (via the headless `--restore` autostart entry) and
@@ -17,28 +22,34 @@
 # By default it uses the bundled prebuilt binaries when they resolve their
 # libraries on this system; otherwise (or with --from-source) it builds from the
 # bundled source tree. Only dependency installation is privileged (uses sudo);
-# every file this script writes lands under $PREFIX (default ~/.local) and ~/.
+# every file this script writes lands under $PREFIX (a per-user install also
+# touches ~/ for autostart and ~/.asoundrc).
 #
 # Usage: ./install.sh [--from-source] [--no-deps] [--no-autostart] [--help]
-#   PREFIX=/usr/local ./install.sh   # system-wide install (needs write access)
+#   sudo PREFIX=/usr/local ./install.sh   # system-wide, no prompt (needs root)
+#   PREFIX=$HOME/.local ./install.sh      # per-user, no prompt
 
 set -euo pipefail
 
 # Directory this script lives in (the unpacked Audio-Gui/ tree).
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-PREFIX="${PREFIX:-$HOME/.local}"
-BINDIR="$PREFIX/bin"
-APPDIR="$PREFIX/share/applications"
+# PREFIX may be given in the environment (wins, no prompt). Otherwise the install
+# mode is chosen interactively below (system-wide vs per-user), mirroring
+# install-jackdaw.sh. All PREFIX-derived paths are resolved in set_paths(), after
+# the mode is settled.
+PREFIX_FROM_ENV=0
+[ -n "${PREFIX:-}" ] && PREFIX_FROM_ENV=1
+PREFIX="${PREFIX:-}"
+
+SYSTEM_INSTALL=0   # set by set_paths(): 1 when PREFIX is outside $HOME
+BINDIR=""
+APPDIR=""
+AUTOSTART_DIR=""
+AUTOSTART_FILE=""
 
 ASOUNDRC="$HOME/.asoundrc"
 ASOUND_MARKER="Written by Audio-Gui"
-
-# Login autostart entry that runs `audio-gui --restore` headless to bring up the
-# saved routing (and write ~/.asoundrc) without opening the GUI. Mirrors what the
-# GUI installs on first launch, so the app treats it as already up to date.
-AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
-AUTOSTART_FILE="$AUTOSTART_DIR/audio-gui-restore.desktop"
 
 # The bridge binaries the GUI launches from alongside itself; pulse-jack-bridge
 # is optional (only present when libjack was available at build time).
@@ -70,8 +81,10 @@ Options:
   --help          Show this help.
 
 Environment:
-  PREFIX          Install prefix (default: ~/.local). Set to e.g. /usr/local for
-                  a system-wide install (requires write access to that prefix).
+  PREFIX          Install prefix. If set, skips the interactive system/user
+                  prompt. Use /usr/local for a system-wide install (run as root;
+                  autostart goes to /etc/xdg/autostart for all users) or
+                  $HOME/.local for a per-user install.
 EOF
 }
 
@@ -104,10 +117,71 @@ die()
 cleanup() { [ -n "$BUILD_TMP" ] && rm -rf -- "$BUILD_TMP"; }
 trap cleanup EXIT
 
-# Refuse to run as root for the default per-user prefix: it would install into
-# root's home and root's autostart. A system PREFIX may legitimately run as root.
-if [ "$(id -u)" -eq 0 ] && [ "$PREFIX" = "$HOME/.local" ]; then
-  die "do not run as root for a per-user install. Run as your normal user, or set PREFIX=/usr/local."
+# Choose system-wide vs per-user when PREFIX was not given in the environment.
+# Mirrors install-jackdaw.sh: system-wide (/usr/local) is the default. A system
+# install serves every user — including the generic live user on a snapshot ISO —
+# so its files land outside any one home and survive the home rename.
+choose_prefix()
+{
+  if [ "$PREFIX_FROM_ENV" -eq 1 ]; then
+    info "Using PREFIX from environment: $PREFIX"
+    return
+  fi
+  if [ ! -t 0 ]; then
+    PREFIX="$HOME/.local"   # non-interactive, no PREFIX: keep the safe default
+    return
+  fi
+  printf '%s\n' "Where should Audio-Gui be installed?" >&2
+  printf '  %s\n' "[1] system-wide  (/usr/local) - every user; needs root/sudo" >&2
+  printf '  %s\n' "[2] this user    ($HOME/.local) - files in your home only" >&2
+  printf '%s' "Choice [1]: " >&2
+  read -r _c || _c=1
+  case "${_c:-1}" in
+    "" | 1) PREFIX="/usr/local" ;;
+    2) PREFIX="$HOME/.local" ;;
+    *) die "invalid choice: $_c" ;;
+  esac
+}
+
+# Resolve all PREFIX-derived paths and the install mode. A system install (PREFIX
+# outside the invoking user's home) puts its autostart entry in the XDG *system*
+# autostart dir (/etc/xdg/autostart), which every user's session reads, with an
+# absolute Exec — so the generic live user gets `audio-gui --restore` at login.
+# A per-user install keeps the entry in ~/.config/autostart as before.
+set_paths()
+{
+  BINDIR="$PREFIX/bin"
+  APPDIR="$PREFIX/share/applications"
+  case "$PREFIX/" in
+    "$HOME"/*) SYSTEM_INSTALL=0 ;;
+    *) SYSTEM_INSTALL=1 ;;
+  esac
+  if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+    AUTOSTART_DIR="/etc/xdg/autostart"
+  else
+    AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+  fi
+  AUTOSTART_FILE="$AUTOSTART_DIR/audio-gui-restore.desktop"
+}
+
+choose_prefix
+set_paths
+
+# A system install writes to /usr/local and /etc/xdg — that needs root. Rather
+# than bail, re-exec under sudo (which prompts for the password). PREFIX is passed
+# through so the re-exec skips the prompt and goes straight to the system install.
+if [ "$SYSTEM_INSTALL" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    info "system-wide install needs root — re-running under sudo (you may be prompted for your password)."
+    exec sudo PREFIX="$PREFIX" "$SELF_DIR/$(basename -- "${BASH_SOURCE[0]}")" "$@"
+  fi
+  die "system-wide install needs root and sudo was not found. Re-run as root: PREFIX=$PREFIX $0"
+fi
+
+# Refuse to run as root for a per-user prefix: it would install into root's home
+# and root's autostart. A system PREFIX may legitimately run as root.
+if [ "$(id -u)" -eq 0 ] && [ "$SYSTEM_INSTALL" -eq 0 ]; then
+  die "do not run as root for a per-user install. Run as your normal user, or choose the system-wide option (PREFIX=/usr/local)."
 fi
 
 # ---- dependency installation ------------------------------------------------
@@ -305,8 +379,13 @@ back_up_user_asoundrc()
   info "backed up your existing ~/.asoundrc to $backup (the uninstaller restores it)"
 }
 
-step "Backing up any existing ~/.asoundrc"
-back_up_user_asoundrc
+# Only meaningful for a per-user install. A system install serves every user, so
+# there is no single ~/.asoundrc to take over here; each user's per-card config is
+# written at their first login by the /etc/xdg/autostart `--restore` entry below.
+if [ "$SYSTEM_INSTALL" -eq 0 ]; then
+  step "Backing up any existing ~/.asoundrc"
+  back_up_user_asoundrc
+fi
 
 # ---- 5. login autostart entry (this is what writes ~/.asoundrc) -------------
 
@@ -349,11 +428,18 @@ fi
 # fail in a session with no audio access (e.g. plain SSH), in which case the
 # autostart entry handles it at the next login.
 ASOUNDRC_WRITTEN=0
-step "Activating audio routing"
-if "$BINDIR/audio-gui" --restore >/dev/null 2>&1; then
+if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+  # System install: don't write the installing account's ~/.asoundrc (it would be
+  # root's, and is per-card so it must be generated on the target hardware). Each
+  # user gets it at their first login via the /etc/xdg/autostart entry.
+  step "Audio routing"
+  info "system install: each user's ~/.asoundrc is written at their first login (autostart)."
+elif "$BINDIR/audio-gui" --restore >/dev/null 2>&1; then
+  step "Activating audio routing"
   ASOUNDRC_WRITTEN=1
   info "wrote ~/.asoundrc and started the default routing"
 else
+  step "Activating audio routing"
   warn "could not activate routing now; it will start at your next login."
 fi
 
@@ -377,5 +463,5 @@ info "Launch 'audio-gui' or pick \"Audio Control\" from your menu."
 if [ "$ASOUNDRC_WRITTEN" -eq 0 ]; then
   printf '\n'
   warn "Audio routing is not active yet."
-  info "Log out and back in (or launch Audio Control once) to start it."
+  info "Log out and back in to start it."
 fi
