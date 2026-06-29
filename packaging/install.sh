@@ -225,6 +225,9 @@ install_runtime_deps()
   elif command -v apk >/dev/null 2>&1; then
     $sudo apk add alsa-utils alsa-lib qt6-qtbase jack \
       || warn "apk could not install all packages; install them manually."
+  elif command -v xbps-install >/dev/null 2>&1; then
+    $sudo xbps-install -Sy alsa-utils alsa-lib qt6-base jack \
+      || warn "xbps could not install all packages; install them manually."
   else
     warn "no supported package manager found. Install these runtime libraries manually:"
     warn "  ALSA (libasound + alsa-utils), Qt6 Widgets, and optionally libjack for JACK routing."
@@ -256,6 +259,9 @@ install_build_deps()
   elif command -v apk >/dev/null 2>&1; then
     $sudo apk add cmake pkgconf g++ make qt6-qtbase-dev alsa-lib-dev jack-dev \
       || warn "apk could not install all build packages; install them manually."
+  elif command -v xbps-install >/dev/null 2>&1; then
+    $sudo xbps-install -Sy base-devel cmake qt6-base-devel alsa-lib-devel jack-devel \
+      || warn "xbps could not install all build packages; install them manually."
   else
     warn "no supported package manager found. Install a C/C++ toolchain, cmake, pkg-config,"
     warn "  Qt6 Widgets dev, ALSA dev, and (optional) libjack dev manually."
