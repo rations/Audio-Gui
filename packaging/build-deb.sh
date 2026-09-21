@@ -48,13 +48,22 @@ command -v dpkg-deb >/dev/null 2>&1 || die "dpkg-deb not found (install the 'dpk
 command -v cmake >/dev/null 2>&1 || die "cmake not found (install build dependencies first)."
 
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-BUILD_DIR="$ROOT/build-release"
+BUILD_DIR="$ROOT/build-deb"
 OUT="$ROOT/audio-gui_${VERSION}_${ARCH}.deb"
 
 # ---- build ------------------------------------------------------------------
 
 step "Building Audio-Gui ($VERSION, $ARCH)"
-cmake -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
+# Build for /usr, which is where a Debian package installs. respath.cpp finds the
+# bundled fonts relative to the installed binary (/usr/bin -> /usr/share/audio-gui)
+# and no longer depends on this being right, but a package whose compiled-in prefix
+# names a path it does not ship is a trap for the next person to read it: keep the
+# two saying the same thing. The fonts are not optional -- without them the GUI
+# falls back to a system face whose metrics tools/uirender never audited.
+#
+# Hence also the deb's OWN build dir rather than the tarball's build-release, which
+# is configured for /usr/local, where install.sh puts a system install.
+cmake -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || echo 2)"
 
 [ -f "$BUILD_DIR/audio-gui" ] || die "missing build output: audio-gui"

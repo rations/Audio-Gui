@@ -153,9 +153,9 @@ set_paths()
   BINDIR="$PREFIX/bin"
   APPDIR="$PREFIX/share/applications"
   # The bundled fonts, and the icon theme found by name from the desktop entry.
-  # respath.cpp looks in $AUDIOGUI_RESOURCE_DIR, then the compiled-in prefix, then
-  # beside the binary -- so a per-user install under ~/.local is found the same way
-  # a system one under /usr/local is.
+  # respath.cpp derives its resource dir from where the installed binary sits
+  # (bin/../share/audio-gui), so a per-user install under ~/.local finds its fonts
+  # the same way a system one under /usr/local does -- prebuilt or built from source.
   RESDIR="$PREFIX/share/audio-gui"
   ICONDIR="$PREFIX/share/icons/hicolor"
   case "$PREFIX/" in
@@ -284,7 +284,10 @@ build_from_source()
 
   step "Building from source"
   BUILD_TMP="$(mktemp -d)"
-  cmake -S "$srcdir" -B "$BUILD_TMP" -DCMAKE_BUILD_TYPE=Release
+  # Build for the prefix we are about to install into: respath.cpp compiles this in
+  # as where it looks for the bundled fonts, so a source build for the default
+  # /usr/local would not find them under $HOME/.local (or any other prefix).
+  cmake -S "$srcdir" -B "$BUILD_TMP" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX"
   cmake --build "$BUILD_TMP" -j"$(nproc 2>/dev/null || echo 2)"
   SRC_BIN_DIR="$BUILD_TMP"
 }
