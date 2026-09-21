@@ -71,11 +71,27 @@ fi
 
 # Source tree for the build-from-source fallback in install.sh. Everything
 # needed to `cmake -B build -S source`.
+#
+# tools/ AND resources/ ARE PART OF THAT NOW: CMakeLists builds the uirender
+# target from tools/, and installs the bundled fonts from resources/, so a source
+# tree missing either does not configure. packaging/icons/ likewise, for the
+# install rule that places the icon theme.
 mkdir -p -- "$PKG/source"
 cp -- "$ROOT/CMakeLists.txt" "$PKG/source/"
 cp -- "$ROOT/pulse_alsa_bridge.c" "$ROOT/pulse_jack_bridge.c" "$PKG/source/"
-cp -r -- "$ROOT/src" "$ROOT/include" "$PKG/source/"
-info "staged source/ (build-from-source fallback)"
+cp -r -- "$ROOT/src" "$ROOT/include" "$ROOT/tools" "$ROOT/resources" "$PKG/source/"
+mkdir -p -- "$PKG/source/packaging"
+cp -r -- "$ROOT/packaging/icons" "$PKG/source/packaging/"
+info "staged source/ (build-from-source fallback, with tools/ and resources/)"
+
+# The fonts and the icon theme again at the TOP of the archive, because install.sh
+# installs them directly for the prebuilt-binary path and must not have to reach
+# into source/ to do it.
+mkdir -p -- "$PKG/resources"
+cp -r -- "$ROOT/resources/fonts" "$PKG/resources/"
+mkdir -p -- "$PKG/icons"
+cp -r -- "$ROOT/packaging/icons/hicolor" "$PKG/icons/"
+info "staged resources/fonts and icons/ (prebuilt-binary path)"
 
 # Scripts, desktop template, and docs.
 install -m 0755 -- "$ROOT/packaging/install.sh" "$PKG/install.sh"

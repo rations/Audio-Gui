@@ -9,50 +9,48 @@
 // to "plughw:CARD=<id>,DEV=<n>" so the plug plugin handles rate/format/channels.
 #pragma once
 
-#include <QString>
-#include <QVector>
+#include <string>
+#include <vector>
 
 namespace AlsaDevices
 {
 
-enum class Category
-{
-  Internal, // analog / on-board card — routed through ALSA "default"
-  Usb, // USB audio interface
-  Hdmi // HDMI / DisplayPort output
+enum class Category {
+    Internal, // analog / on-board card — routed through ALSA "default"
+    Usb,      // USB audio interface
+    Hdmi      // HDMI / DisplayPort output
 };
 
-struct OutputDevice
-{
-  QString cardId; // stable ALSA card id (e.g. "PCH"), from snd_ctl_card_info_get_id
-  QString displayName; // human label for the dropdown
-  int cardIndex = -1; // current card number (unstable across reboots/hotplug)
-  int pcmIndex = 0; // playback PCM device number on the card
-  Category category = Category::Internal;
+struct OutputDevice {
+    std::string cardId;      // stable ALSA card id (e.g. "PCH"), from snd_ctl_card_info_get_id
+    std::string displayName; // human label for the dropdown
+    int cardIndex = -1;      // current card number (unstable across reboots/hotplug)
+    int pcmIndex = 0;        // playback PCM device number on the card
+    Category category = Category::Internal;
 };
 
 // All playback-capable devices, in card/device order. Empty on a system with no
 // sound cards.
-QVector<OutputDevice> enumerateOutputs();
+std::vector<OutputDevice> enumerateOutputs();
 
 // The ALSA PCM string to hand the bridge for a device: "default" for Internal,
 // "plughw:CARD=<id>,DEV=<n>" otherwise.
-QString deviceStringFor(const OutputDevice& dev);
+std::string deviceStringFor(const OutputDevice &dev);
 
 // Stable, persistable identity of a device: "" for Internal (== ALSA "default"),
 // else "<cardId>:<pcmIndex>" (card id is stable; pcm index disambiguates the
 // several HDMI outputs that share one card).
-QString tokenFor(const OutputDevice& dev);
+std::string tokenFor(const OutputDevice &dev);
 
 // The card id embedded in a token (the part before ':'), for opening the mixer.
 // Empty token / Internal -> empty (caller uses "default").
-QString cardIdFromToken(const QString& token);
+std::string cardIdFromToken(const std::string &token);
 
 // Find a device by its token; returns nullptr if absent (e.g. unplugged).
-const OutputDevice* findByToken(const QVector<OutputDevice>& devices, const QString& token);
+const OutputDevice *findByToken(const std::vector<OutputDevice> &devices, const std::string &token);
 
 // Stable card id of the first Internal output, for the baseline ~/.asoundrc
 // slave. Empty if no internal card was found.
-QString firstInternalCardId();
+std::string firstInternalCardId();
 
 } // namespace AlsaDevices

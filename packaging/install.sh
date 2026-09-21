@@ -152,6 +152,12 @@ set_paths()
 {
   BINDIR="$PREFIX/bin"
   APPDIR="$PREFIX/share/applications"
+  # The bundled fonts, and the icon theme found by name from the desktop entry.
+  # respath.cpp looks in $AUDIOGUI_RESOURCE_DIR, then the compiled-in prefix, then
+  # beside the binary -- so a per-user install under ~/.local is found the same way
+  # a system one under /usr/local is.
+  RESDIR="$PREFIX/share/audio-gui"
+  ICONDIR="$PREFIX/share/icons/hicolor"
   case "$PREFIX/" in
     "$HOME"/*) SYSTEM_INSTALL=0 ;;
     *) SYSTEM_INSTALL=1 ;;
@@ -208,29 +214,29 @@ install_runtime_deps()
     return 0
   fi
   if command -v apt-get >/dev/null 2>&1; then
-    $sudo apt-get install -y alsa-utils libasound2 libqt6widgets6 libjack-jackd2-0 \
+    $sudo apt-get install -y alsa-utils libasound2 libcairo2 libfreetype6 libx11-6 libjack-jackd2-0 \
       || warn "apt-get could not install all packages; install them manually."
   elif command -v dnf >/dev/null 2>&1; then
-    $sudo dnf install -y alsa-utils alsa-lib qt6-qtbase jack-audio-connection-kit \
+    $sudo dnf install -y alsa-utils alsa-lib cairo freetype libX11 jack-audio-connection-kit \
       || warn "dnf could not install all packages; install them manually."
   elif command -v yum >/dev/null 2>&1; then
-    $sudo yum install -y alsa-utils alsa-lib qt6-qtbase jack-audio-connection-kit \
+    $sudo yum install -y alsa-utils alsa-lib cairo freetype libX11 jack-audio-connection-kit \
       || warn "yum could not install all packages; install them manually."
   elif command -v pacman >/dev/null 2>&1; then
-    $sudo pacman -S --needed --noconfirm alsa-utils alsa-lib qt6-base jack2 \
+    $sudo pacman -S --needed --noconfirm alsa-utils alsa-lib cairo freetype2 libx11 jack2 \
       || warn "pacman could not install all packages; install them manually."
   elif command -v zypper >/dev/null 2>&1; then
-    $sudo zypper install -y alsa-utils libasound2 libQt6Widgets6 libjack0 \
+    $sudo zypper install -y alsa-utils libasound2 libcairo2 libfreetype6 libX11-6 libjack0 \
       || warn "zypper could not install all packages; install them manually."
   elif command -v apk >/dev/null 2>&1; then
-    $sudo apk add alsa-utils alsa-lib qt6-qtbase jack \
+    $sudo apk add alsa-utils alsa-lib cairo freetype libx11 jack \
       || warn "apk could not install all packages; install them manually."
   elif command -v xbps-install >/dev/null 2>&1; then
-    $sudo xbps-install -Sy alsa-utils alsa-lib qt6-base jack \
+    $sudo xbps-install -Sy alsa-utils alsa-lib cairo freetype libX11 jack \
       || warn "xbps could not install all packages; install them manually."
   else
     warn "no supported package manager found. Install these runtime libraries manually:"
-    warn "  ALSA (libasound + alsa-utils), Qt6 Widgets, and optionally libjack for JACK routing."
+    warn "  ALSA (libasound + alsa-utils), Cairo, FreeType, libX11, and optionally libjack."
   fi
 }
 
@@ -242,29 +248,29 @@ install_build_deps()
     return 0
   fi
   if command -v apt-get >/dev/null 2>&1; then
-    $sudo apt-get install -y cmake pkg-config g++ qt6-base-dev libasound2-dev libjack-jackd2-dev \
+    $sudo apt-get install -y cmake pkg-config g++ libcairo2-dev libfreetype6-dev libx11-dev libasound2-dev libjack-jackd2-dev \
       || warn "apt-get could not install all build packages; install them manually."
   elif command -v dnf >/dev/null 2>&1; then
-    $sudo dnf install -y cmake pkgconf-pkg-config gcc-c++ qt6-qtbase-devel alsa-lib-devel \
+    $sudo dnf install -y cmake pkgconf-pkg-config gcc-c++ cairo-devel freetype-devel libX11-devel alsa-lib-devel \
       jack-audio-connection-kit-devel || warn "dnf could not install all build packages; install them manually."
   elif command -v yum >/dev/null 2>&1; then
-    $sudo yum install -y cmake pkgconf-pkg-config gcc-c++ qt6-qtbase-devel alsa-lib-devel \
+    $sudo yum install -y cmake pkgconf-pkg-config gcc-c++ cairo-devel freetype-devel libX11-devel alsa-lib-devel \
       jack-audio-connection-kit-devel || warn "yum could not install all build packages; install them manually."
   elif command -v pacman >/dev/null 2>&1; then
-    $sudo pacman -S --needed --noconfirm cmake pkgconf gcc qt6-base alsa-lib jack2 \
+    $sudo pacman -S --needed --noconfirm cmake pkgconf gcc cairo freetype2 libx11 alsa-lib jack2 \
       || warn "pacman could not install all build packages; install them manually."
   elif command -v zypper >/dev/null 2>&1; then
-    $sudo zypper install -y cmake pkg-config gcc-c++ qt6-base-devel alsa-devel libjack-devel \
+    $sudo zypper install -y cmake pkg-config gcc-c++ cairo-devel freetype2-devel libX11-devel alsa-devel libjack-devel \
       || warn "zypper could not install all build packages; install them manually."
   elif command -v apk >/dev/null 2>&1; then
-    $sudo apk add cmake pkgconf g++ make qt6-qtbase-dev alsa-lib-dev jack-dev \
+    $sudo apk add cmake pkgconf g++ make cairo-dev freetype-dev libx11-dev alsa-lib-dev jack-dev \
       || warn "apk could not install all build packages; install them manually."
   elif command -v xbps-install >/dev/null 2>&1; then
-    $sudo xbps-install -Sy base-devel cmake qt6-base-devel alsa-lib-devel jack-devel \
+    $sudo xbps-install -Sy base-devel cmake cairo-devel freetype-devel libX11-devel alsa-lib-devel jack-devel \
       || warn "xbps could not install all build packages; install them manually."
   else
     warn "no supported package manager found. Install a C/C++ toolchain, cmake, pkg-config,"
-    warn "  Qt6 Widgets dev, ALSA dev, and (optional) libjack dev manually."
+    warn "  Cairo, FreeType and libX11 dev, ALSA dev, and (optional) libjack dev manually."
   fi
 }
 
@@ -342,8 +348,57 @@ done
 
 # Best-effort: warn if the installed binary can't resolve its shared libraries.
 if command -v ldd >/dev/null 2>&1 && ldd "$BINDIR/audio-gui" 2>/dev/null | grep -q 'not found'; then
-  warn "audio-gui has unresolved libraries (Qt6/ALSA may be missing):"
+  warn "audio-gui has unresolved libraries (Cairo/FreeType/X11/ALSA may be missing):"
   ldd "$BINDIR/audio-gui" 2>/dev/null | grep 'not found' >&2 || true
+fi
+
+# ---- 2b. fonts and icons ----------------------------------------------------
+
+# THE FONTS ARE NOT OPTIONAL. There is no toolkit to fall back on: the GUI draws
+# its own text through FreeType, and without these it uses a cairo toy
+# "sans-serif" whose metrics are whatever this machine happens to have -- which is
+# exactly the case the layout was never audited against. The licences travel with
+# them (Roboto Apache-2.0, Michroma OFL-1.1).
+step "Installing fonts to $RESDIR/fonts"
+if [ -d "$SELF_DIR/resources/fonts" ]; then
+  FONT_SRC="$SELF_DIR/resources/fonts"
+elif [ -d "$SELF_DIR/source/resources/fonts" ]; then
+  FONT_SRC="$SELF_DIR/source/resources/fonts"
+else
+  FONT_SRC=""
+fi
+if [ -n "$FONT_SRC" ]; then
+  mkdir -p -- "$RESDIR/fonts"
+  for f in "$FONT_SRC"/*; do
+    [ -f "$f" ] && install -m 0644 -- "$f" "$RESDIR/fonts/$(basename -- "$f")"
+  done
+  info "installed $(ls -1 "$RESDIR/fonts" | wc -l) font files"
+else
+  warn "bundled fonts not found in the archive; the GUI will fall back to a system face"
+fi
+
+# The icon theme. A desktop environment finds this by NAME from the desktop
+# entry's Icon= key; a plain window manager instead reads the _NET_WM_ICON the
+# window publishes, which is compiled into the binary and needs nothing here.
+if [ -d "$SELF_DIR/icons/hicolor" ]; then
+  ICON_SRC="$SELF_DIR/icons/hicolor"
+elif [ -d "$SELF_DIR/source/packaging/icons/hicolor" ]; then
+  ICON_SRC="$SELF_DIR/source/packaging/icons/hicolor"
+else
+  ICON_SRC=""
+fi
+if [ -n "$ICON_SRC" ]; then
+  step "Installing icon theme to $ICONDIR"
+  mkdir -p -- "$ICONDIR"
+  cp -a -- "$ICON_SRC/." "$ICONDIR/"
+  find "$ICONDIR" -type d -exec chmod 0755 {} + 2>/dev/null || true
+  find "$ICONDIR" -type f -exec chmod 0644 {} + 2>/dev/null || true
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f "$ICONDIR" 2>/dev/null || true
+  fi
+  info "installed the audio-gui icon ladder"
+else
+  info "no icon theme in the archive (the window still carries its own built-in icon)"
 fi
 
 # ---- 3. desktop menu entry --------------------------------------------------

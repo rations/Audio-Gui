@@ -1,9 +1,13 @@
 # Audio-Gui
 
-A small, Qt6 desktop app for controlling Linux audio on **ALSA-only**
+A small desktop app for controlling Linux audio on **ALSA-only**
 systems — no PulseAudio daemon, no PipeWire. It combines the everyday
 `alsamixer` controls with a toggle for the bundled PulseAudio-compatibility
 bridges, so apps that only speak PulseAudio still get sound.
+
+**No widget toolkit.** The interface is drawn directly with Cairo and FreeType on
+a plain X11 window — no Qt, no GTK, no GLib. The whole runtime dependency set is
+`libasound2`, `libcairo2`, `libfreetype6` and `libX11`.
 
 ## What it does
 
@@ -30,10 +34,14 @@ bridges, so apps that only speak PulseAudio still get sound.
   (Applies to the PA Bridge → ALSA path; the dropdown is disabled in the other
   modes.)
 - **Switches** — Capture and IEC958 (S/PDIF) toggles, when the card provides them.
-- **Appearance** — a self-contained modern theme (Fusion + stylesheet) that looks the
-  same on every system rather than inheriting the user's Qt/GTK theme. A dark/light
-  toggle (dark by default) and an accent colour (green / orange / blue / yellow) sit at
-  the bottom of the window; both choices persist.
+- **Level meters** — stereo output meters fed by the running bridge through a
+  lock-free shared-memory page, with instant attack, exponential release and a
+  peak marker that holds about a second before falling. They idle at zero cost:
+  once everything has settled to silence the window stops repainting entirely.
+- **Appearance** — a self-contained look that is the same on every system, because
+  the program draws it itself and ships its own fonts rather than inheriting a
+  desktop theme. A dark/light toggle (dark by default) and an accent colour
+  (green / orange / blue / yellow) sit at the bottom of the window; both persist.
 
 The bridge runs **independently of the GUI**: it keeps playing after you close the
 window, the chosen mode is remembered, and it is brought back up at login by an
@@ -95,7 +103,7 @@ up any existing one to `~/.asoundrc.bak`. Useful flags:
 
 The tarball ships **prebuilt binaries plus the full source**. By default
 `install.sh` uses the prebuilt binaries when they resolve their libraries on your
-system; if they can't (different glibc/Qt6), it **automatically builds from the
+system; if they can't (different glibc/Cairo), it **automatically builds from the
 bundled source** instead. Remove with `./uninstall.sh` (`--purge` also drops
 saved settings).
 
@@ -106,9 +114,15 @@ The released binaries are built on **Debian 12 (bookworm)**, so they need:
 | Requirement | Minimum version |
 |---|---|
 | glibc | **≥ 2.36** (Debian 12 / Ubuntu 22.04 / Fedora 37 era or newer) |
-| Qt6 Widgets | **≥ 6.4** |
+| Cairo | `libcairo2` |
+| FreeType | `libfreetype6` |
+| X11 | `libX11` |
 | ALSA | `libasound2` + `alsa-utils` |
 | JACK *(optional)* | any `libjack` — only for JACK routing |
+
+The two fonts the interface draws with (Roboto, Michroma) are **bundled and
+installed with the program**, so text measures the same everywhere and does not
+depend on what fontconfig happens to offer.
 
 On older systems (e.g. RHEL 8's glibc 2.28) the prebuilt binaries won't run — use
 `./install.sh --from-source`, which builds against your own libraries.
@@ -128,11 +142,34 @@ executable, so keep them in the same directory.
 
 | | Packages (Debian/Ubuntu names) |
 |---|---|
-| Build | `cmake`, `pkg-config`, `qt6-base-dev`, `libasound2-dev`, `libjack-jackd2-dev` *(optional, for JACK routing)* |
-| Runtime | `libasound2`, `alsa-utils`, Qt6 Widgets runtime; `jackd2`/`libjack` only for JACK mode |
+| Build | `cmake`, `pkg-config`, `g++`, `libcairo2-dev`, `libfreetype6-dev`, `libx11-dev`, `libasound2-dev`, `libjack-jackd2-dev` *(optional, for JACK routing)* |
+| Runtime | `libasound2`, `alsa-utils`, `libcairo2`, `libfreetype6`, `libx11-6`; `jackd2`/`libjack` only for JACK mode |
 
 If libjack is missing at build time, `pulse-jack-bridge` is skipped and the GUI
 keeps the JACK option disabled.
+
+### Checking the layout (`uirender`)
+
+The build produces a second binary, `uirender`, which draws **the real panel** to
+PNG with no X server and no sound card, then audits it:
+
+```sh
+./build/uirender --out /tmp/ui     # exit status 0 only if everything fits
+```
+
+It exists because two kinds of layout mistake are silent. A label wider than its
+slot is truncated with an ellipsis, so the window still draws and the developer
+never sees it — only a user with different font metrics does. And a character the
+bundled fonts have no glyph for measures as **zero width**, so it passes a
+does-it-fit check and renders as a hole; that is exactly how the routing labels'
+`→` was caught after the Qt build had been falling back to a system font for it.
+
+`uirender` also writes the meter at several levels, which is the one part of the
+window you cannot check from a screenshot of the running program — by the time
+you have the screenshot, the level has moved.
+
+This is why `src/gfx/` and `src/panel.cpp` link Cairo and **never** X11: an
+`#include <X11/Xlib.h>` in the drawing layer costs the whole offline audit.
 
 ### Creating a release
 
@@ -145,7 +182,7 @@ This builds in Release mode and produces `audio-gui-<version>.tar.gz` (prebuilt
 binaries + bundled source + `install.sh`/`uninstall.sh`) that unpacks to a single
 `Audio-Gui/` directory. Bump [`VERSION`](VERSION) when cutting a release. For the
 widest compatibility, run it on the **oldest** system you support (the project
-ships releases built on Debian 12) so the binaries' glibc/Qt6 floor stays low.
+ships releases built on Debian 12) so the binaries' glibc floor stays low.
 
 ## Run
 
