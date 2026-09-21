@@ -1,79 +1,24 @@
-AccessModifierOffset: -2
-AlignAfterOpenBracket: Align
-AlignConsecutiveAssignments: false
-AlignConsecutiveDeclarations: false
-AlignEscapedNewlines: Right
-AlignOperands: true
-AlignTrailingComments: false
-AllowAllParametersOfDeclarationOnNextLine: false
-AllowShortBlocksOnASingleLine: true
-AllowShortCaseLabelsOnASingleLine: true
-AllowShortFunctionsOnASingleLine: Inline
+# The style the rest of this family of projects uses -- CPU-Power, simple-login-gui and the
+# rations-amp editor all share it, and src/gfx/ and src/platform/ are vendored from them.
+#
+# IT CHANGED WHEN Qt WENT. The previous style here was Allman braces at two spaces, which was
+# this project's own; keeping it would have meant reformatting every vendored file on import and
+# losing the ability to diff canvas.cpp or x11window.cpp against the copy it came from. That diff
+# is worth more than the old brace placement.
+#
+# The two bridge .c files are deliberately NOT formatted to this: they are untouched, working
+# audio code, and rewrapping four thousand lines of it to settle a brace argument would bury
+# every real change that ever lands near them.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: None
 AllowShortIfStatementsOnASingleLine: false
 AllowShortLoopsOnASingleLine: false
-AlwaysBreakAfterDefinitionReturnType: None
-AlwaysBreakAfterReturnType: None
-AlwaysBreakBeforeMultilineStrings: true
-AlwaysBreakTemplateDeclarations: true
-BinPackArguments: true
-BinPackParameters: true
-BraceWrapping:
-  AfterCaseLabel: true
-  AfterClass: true
-  AfterControlStatement: true
-  AfterEnum: true
-  AfterFunction: true
-  AfterNamespace: true
-  AfterStruct: true
-  AfterUnion: true
-  BeforeCatch: true
-  BeforeElse: true
-  IndentBraces: false
-  SplitEmptyFunction: true
-  SplitEmptyRecord: true
-  SplitEmptyNamespace: true
-BreakBeforeBinaryOperators: NonAssignment
-BreakBeforeBraces: Custom
-BreakBeforeInheritanceComma: false
-BreakBeforeTernaryOperators: true
-BreakConstructorInitializers: BeforeComma
-BreakStringLiterals: true
-ColumnLimit: 120
-CompactNamespaces: false
-ConstructorInitializerAllOnOneLineOrOnePerLine: false
-ConstructorInitializerIndentWidth: 0
-ContinuationIndentWidth: 2
-Cpp11BracedListStyle: true
-DerivePointerAlignment: false
-FixNamespaceComments: true
-IndentCaseLabels: true
-IndentPPDirectives: BeforeHash
-IndentWidth: 2
-IndentWrappedFunctionNames: false
-KeepEmptyLinesAtTheStartOfBlocks: true
-MaxEmptyLinesToKeep: 2
-NamespaceIndentation: None
-ObjCBinPackProtocolList: Auto
-ObjCBlockIndentWidth: 2
-ObjCBreakBeforeNestedBlockParam: true
-ObjCSpaceAfterProperty: false
-ObjCSpaceBeforeProtocolList: true
-PenaltyBreakBeforeFirstCallParameter: 0
-PenaltyReturnTypeOnItsOwnLine: 1000
-PointerAlignment: Left
-ReflowComments: true
 SortIncludes: false
-SortUsingDeclarations: true
-SpaceAfterCStyleCast: false
-SpaceAfterTemplateKeyword: true
-SpaceBeforeAssignmentOperators: true
-SpaceBeforeParens: ControlStatements
-SpaceInEmptyParentheses: false
-SpacesBeforeTrailingComments: 1
-SpacesInAngles: false
-SpacesInContainerLiterals: true
-SpacesInCStyleCastParentheses: false
-SpacesInParentheses: false
-SpacesInSquareBrackets: false
-Standard: Cpp11
-UseTab: Never
+IndentCaseLabels: true
+AccessModifierOffset: -4
