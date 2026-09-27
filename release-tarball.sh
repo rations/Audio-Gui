@@ -2,8 +2,14 @@
 #
 # Build Audio-Gui and package a release tarball.
 #
-# Produces audio-gui-<version>.tar.gz that unpacks to a single Audio-Gui/
-# directory containing the prebuilt binaries plus install.sh / uninstall.sh.
+# Produces audio-gui-<version>-linux-<arch>.tar.gz that unpacks to a single
+# Audio-Gui/ directory containing the prebuilt binaries plus install.sh /
+# uninstall.sh. <arch> is read from the built binary itself (x86_64, aarch64), so
+# the name says what it runs on, not where it was packed.
+#
+# The x86_64 release is built by hand on a Debian 12 machine; the aarch64 one by
+# .github/workflows/linux-aarch64.yml in a debian:12 container. Both read the
+# same VERSION file, so every architecture's tarball carries one number.
 #
 # Usage: ./release-tarball.sh [version]
 #   With no argument the version is read from the VERSION file (bump that when
@@ -24,7 +30,6 @@ else
 fi
 [ -n "$VERSION" ] || { echo "ERROR: could not determine a version (empty VERSION file?)" >&2; exit 1; }
 BUILD_DIR="$ROOT/build-release"
-OUT="$ROOT/audio-gui-$VERSION.tar.gz"
 
 info() { printf '  %s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -39,6 +44,19 @@ die()
 step "Building Audio-Gui ($VERSION)"
 cmake -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || echo 2)"
+
+# A binary tarball only runs on one architecture, so it says which in its name.
+# Taken from the ELF header rather than uname -m, so the name is what the binary
+# IS; uname is only the fallback when readelf is missing.
+ARCH=""
+if command -v readelf >/dev/null 2>&1; then
+  case "$(readelf -h "$BUILD_DIR/audio-gui" 2>/dev/null)" in
+    *X86-64*) ARCH=x86_64 ;;
+    *AArch64*) ARCH=aarch64 ;;
+  esac
+fi
+[ -n "$ARCH" ] || ARCH="$(uname -m)"
+OUT="$ROOT/audio-gui-$VERSION-linux-$ARCH.tar.gz"
 
 # ---- stage ------------------------------------------------------------------
 
@@ -99,7 +117,8 @@ install -m 0755 -- "$ROOT/packaging/uninstall.sh" "$PKG/uninstall.sh"
 install -m 0644 -- "$ROOT/packaging/audio-gui.desktop.in" "$PKG/audio-gui.desktop.in"
 install -m 0644 -- "$ROOT/README.md" "$PKG/README.md"
 install -m 0644 -- "$ROOT/LICENSE.txt" "$PKG/LICENSE.txt"
-info "staged install.sh, uninstall.sh, desktop template, README, LICENSE"
+printf '%s\n' "$VERSION" >"$PKG/VERSION"
+info "staged install.sh, uninstall.sh, desktop template, README, LICENSE, VERSION"
 
 # ---- archive ----------------------------------------------------------------
 

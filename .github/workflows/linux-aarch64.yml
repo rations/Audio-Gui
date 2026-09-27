@@ -1,0 +1,187 @@
+# aarch64 Linux build, gates, release tarball and .deb.
+#
+# WHY THIS EXISTS. x86_64 releases are built on the author's own Debian 12
+# machine. There is no ARM hardware on the development box, so the aarch64
+# build can only be compiled and checked on a runner of its own architecture,
+# and then carried to a Raspberry Pi by hand.
+#
+# WHY A DEBIAN CONTAINER ON AN UBUNTU RUNNER. `runs-on:` names the virtual
+# machine, and GitHub hosts no Debian runner. Everything that reaches the
+# tarball -- compiler, glibc, libstdc++, cairo, FreeType, libX11, ALSA, JACK --
+# comes from debian:12 (bookworm). Ubuntu contributes only the kernel, Docker
+# and the git that does the checkout. Debian 12 is glibc 2.36, the same floor
+# as the x86_64 release, so the binaries run on bookworm-era systems (Raspberry
+# Pi OS included); a bare ubuntu-24.04-arm runner is glibc 2.39 and would raise
+# that floor.
+#
+# THE VERSION. release-tarball.sh and build-deb.sh are called with no argument,
+# so both read the VERSION file at the repo root -- the same file the x86_64
+# release reads. The package step checks the output names against it.
+#
+# WHAT THIS DOES NOT COVER: no live audio, no ALSA card, no JACK server, no X
+# display for the window itself. It proves the aarch64 build compiles clean,
+# links, stays under the glibc ceiling, passes the dependency allowlist and the
+# headless layout audit (uirender), and packages -- not that it plays on a board.
+name: Linux aarch64
+
+# Every push on every branch, except commits that cannot change the build. The
+# list says what to IGNORE rather than what to match, so a forgotten entry costs
+# a spare run instead of silently skipping a check. README.md is ignored even
+# though the tarball ships it: it cannot break the build.
+on:
+  push:
+    branches: ['**']
+    paths-ignore: &docs_only
+      - '**.md'
+      - 'LICENSE.txt'
+      - '.gitignore'
+  pull_request:
+    paths-ignore: *docs_only
+  workflow_dispatch:
+
+concurrency:
+  group: linux-aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: aarch64 (ubuntu-24.04-arm, debian:12)
+    # GitHub-hosted arm64 runner, free for public repositories. Check the label
+    # against https://github.com/actions/runner-images before changing it.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build, gate and package inside Debian 12
+        run: |
+          docker run --rm -i \
+            -v "$PWD:/src" -w /src \
+            "debian:12" \
+            bash -euo pipefail -s <<'CONTAINER'
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+
+          # One dev package per pkg_check_modules() in CMakeLists.txt: alsa,
+          # jack (optional there, required here so the JACK bridge ships),
+          # cairo + cairo-ft + cairo-xlib (all libcairo2-dev), freetype2 and
+          # x11. file and binutils are what the gates below run on;
+          # release-tarball.sh reads the arch with readelf, build-deb.sh uses
+          # dpkg-deb, which the base image already has.
+          apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config ca-certificates file binutils \
+            libcairo2-dev libfreetype-dev libx11-dev \
+            libasound2-dev libjack-jackd2-dev
+
+          # No `| head -1` on these: under pipefail, head closing the pipe early
+          # kills ldd with SIGPIPE (status 141) and errexit ends the job.
+          echo "== toolchain and ABI floor =="
+          cc --version
+          cmake --version
+          ldd --version
+          uname -m
+
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          [ -n "$VERSION" ] || { echo "FAIL: VERSION file is empty" >&2; exit 1; }
+          echo "== version $VERSION (from ./VERSION) =="
+
+          echo "== build and package the release tarball =="
+          ./release-tarball.sh 2>&1 | tee build.log
+
+          BINS="build-release/audio-gui build-release/pa-alsa-bridge build-release/pulse-jack-bridge build-release/uirender"
+
+          # The x86_64 build is warning-free under -Wall -Wextra, so any warning
+          # here is new and architecture-specific -- e.g. -Wtype-limits firing
+          # because char is unsigned on aarch64.
+          echo "== gate: no compiler warnings =="
+          if grep -E 'warning:' build.log; then
+            echo "FAIL: compiler warnings above" >&2; exit 1
+          fi
+
+          echo "== gate: every binary is aarch64 and resolves its libraries =="
+          for b in $BINS; do
+            [ -f "$b" ] || { echo "FAIL: $b was not built" >&2; exit 1; }
+            info=$(file -b "$b")
+            echo "$b: $info"
+            case "$info" in
+              *'ARM aarch64'*) ;;
+              *) echo "FAIL: $b is not aarch64" >&2; exit 1 ;;
+            esac
+            if ldd "$b" | grep 'not found'; then
+              echo "FAIL: $b has unresolved libraries" >&2; exit 1
+            fi
+          done
+
+          # The container is what sets the floor; this catches a change of
+          # image, or a symbol pulled from a newer glibc some other way.
+          echo "== gate: glibc symbol ceiling 2.36 =="
+          for b in $BINS; do
+            max=$(objdump -T "$b" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -n1)
+            echo "$b: GLIBC_$max"
+            if [ "$(printf '%s\n2.36\n' "$max" | sort -V | tail -n1)" != "2.36" ]; then
+              echo "FAIL: $b needs GLIBC_$max > 2.36" >&2; exit 1
+            fi
+          done
+
+          echo "== gate: the GUI links only allowlisted libraries =="
+          scripts/check-deps.sh build-release/audio-gui
+
+          # Draws the real panel with the bundled fonts and fails if any string
+          # overflows its slot or needs a glyph the fonts do not have. Needs no
+          # X server, so it runs here; the frames are uploaded for a look.
+          echo "== gate: headless layout audit =="
+          mkdir -p ui
+          build-release/uirender --out ui
+          ls -l ui
+
+          echo "== gate: the tarball is named from VERSION =="
+          TARBALL="audio-gui-$VERSION-linux-aarch64.tar.gz"
+          [ -f "$TARBALL" ] || { echo "FAIL: $TARBALL was not written" >&2; ls -l audio-gui-*.tar.gz >&2 || true; exit 1; }
+          # Compared as strings, not piped into grep -q: under pipefail an
+          # early-exiting grep can SIGPIPE the writer (see ldd above).
+          [ "$(tar -xzOf "$TARBALL" Audio-Gui/VERSION)" = "$VERSION" ] \
+            || { echo "FAIL: $TARBALL does not carry VERSION $VERSION" >&2; exit 1; }
+          ls -l "$TARBALL"
+
+          echo "== build the arm64 .deb =="
+          packaging/build-deb.sh
+          DEB="audio-gui_${VERSION}_arm64.deb"
+          [ -f "$DEB" ] || { echo "FAIL: $DEB was not written" >&2; ls -l audio-gui_*.deb >&2 || true; exit 1; }
+          dpkg-deb -I "$DEB"
+          [ "$(dpkg-deb -f "$DEB" Architecture)" = arm64 ] \
+            || { echo "FAIL: $DEB is not Architecture: arm64" >&2; exit 1; }
+          [ "$(dpkg-deb -f "$DEB" Version)" = "$VERSION" ] \
+            || { echo "FAIL: $DEB is not Version: $VERSION" >&2; exit 1; }
+          ls -l "$DEB"
+          CONTAINER
+
+      # The container ran as root, so everything it wrote is root-owned and the
+      # upload action, which does not run as root, cannot read it.
+      - name: Hand the workspace back to the runner
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .
+
+      # Artifacts and not a release: the aarch64 build has not run on real
+      # hardware until someone tests it on a Pi, so it is attached to a
+      # release by hand after that.
+      - name: Upload the release tarball
+        uses: actions/upload-artifact@v6
+        with:
+          name: audio-gui-linux-aarch64
+          path: audio-gui-*-linux-aarch64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@v6
+        with:
+          name: audio-gui-deb-arm64
+          path: audio-gui_*_arm64.deb
+          if-no-files-found: error
+
+      - name: Upload the layout audit frames
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: uirender-aarch64
+          path: ui/
+          if-no-files-found: ignore

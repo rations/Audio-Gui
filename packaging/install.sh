@@ -292,11 +292,30 @@ build_from_source()
   SRC_BIN_DIR="$BUILD_TMP"
 }
 
-# True if the prebuilt audio-gui exists and resolves all its libraries here.
+# True if the ELF binary $1 was built for this machine's architecture.
+#
+# The ldd check below cannot answer this: ldd on a foreign binary says "not a
+# dynamic executable", never "not found", so an x86_64 tarball unpacked on a Pi
+# would pass it. e_machine is the 2-byte field at offset 18 of the ELF header,
+# read with od (coreutils) because readelf is not on a stock Pi.
+prebuilt_arch_matches()
+{
+  local machine
+  machine="$(od -An -t u2 -j 18 -N 2 -- "$1" 2>/dev/null | tr -d ' ')"
+  case "$(uname -m):$machine" in
+    x86_64:62 | amd64:62) return 0 ;;
+    aarch64:183 | arm64:183) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# True if the prebuilt audio-gui exists, is for this architecture, and resolves
+# all its libraries here.
 prebuilt_runnable()
 {
   local b="$SELF_DIR/bin/audio-gui"
   [ -f "$b" ] || return 1
+  prebuilt_arch_matches "$b" || return 1
   command -v ldd >/dev/null 2>&1 || return 0 # can't check; assume usable
   ! ldd "$b" 2>/dev/null | grep -q 'not found'
 }

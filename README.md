@@ -82,10 +82,12 @@ needs only membership of the `audio` group, exactly as opening `default` does.
 
 ## Install (release tarball)
 
-Grab a release `audio-gui-<version>.tar.gz`, unpack it, and run the installer:
+Grab the release tarball for your machine, `audio-gui-<version>-linux-x86_64.tar.gz`
+or `audio-gui-<version>-linux-aarch64.tar.gz` (Raspberry Pi and other 64-bit ARM
+boards), unpack it, and run the installer:
 
 ```sh
-tar xzf audio-gui-<version>.tar.gz
+tar xzf audio-gui-<version>-linux-<arch>.tar.gz
 cd Audio-Gui
 chmod +x install.sh && ./install.sh
 ```
@@ -104,7 +106,8 @@ up any existing one to `~/.asoundrc.bak`. Useful flags:
 The tarball ships **prebuilt binaries plus the full source**. By default
 `install.sh` uses the prebuilt binaries when they resolve their libraries on your
 system; if they can't (different glibc/Cairo), it **automatically builds from the
-bundled source** instead. Remove with `./uninstall.sh` (`--purge` also drops
+bundled source** instead. The same happens when the prebuilt binaries are for a
+different architecture than your machine. Remove with `./uninstall.sh` (`--purge` also drops
 saved settings).
 
 ### Prebuilt binary requirements
@@ -178,11 +181,19 @@ This is why `src/gfx/` and `src/panel.cpp` link Cairo and **never** X11: an
 ./release-tarball.sh 0.2.0    # or override it for a one-off build
 ```
 
-This builds in Release mode and produces `audio-gui-<version>.tar.gz` (prebuilt
+This builds in Release mode and produces `audio-gui-<version>-linux-<arch>.tar.gz`
+(`<arch>` is read from the built binary: `x86_64` or `aarch64`; prebuilt
 binaries + bundled source + `install.sh`/`uninstall.sh`) that unpacks to a single
 `Audio-Gui/` directory. Bump [`VERSION`](VERSION) when cutting a release. For the
 widest compatibility, run it on the **oldest** system you support (the project
 ships releases built on Debian 12) so the binaries' glibc floor stays low.
+
+The **aarch64** tarball and an **arm64 `.deb`** come from the
+[`Linux aarch64`](.github/workflows/linux-aarch64.yml) GitHub Actions workflow,
+which builds in a `debian:12` container on an arm64 runner, gates the result
+(aarch64 ELF, glibc ≤ 2.36, dependency allowlist, `uirender` audit) and uploads
+both as run artifacts. It reads the same `VERSION` file, so both architectures
+ship under one version number. x86_64 is built locally with `./release-tarball.sh`.
 
 ## Run
 
